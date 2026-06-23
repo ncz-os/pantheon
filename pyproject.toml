@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mnemos-pantheon"
+version = "0.2.0"
+description = "Extracted PANTHEON LLM facade subsystem for the Mnemos namespace."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mnemos-core",
+    "mnemos-graeae",
+    "mnemos-knemon",
+    "fastapi",
+    "gunicorn",
+    "httpx",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+nats = ["nats-py"]
+test = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "mnemos.api",
+    "mnemos.api.routes",
+    "mnemos.domain.pantheon",
+    "mnemos.domain.pantheon.*",
+]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
