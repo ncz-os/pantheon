@@ -110,6 +110,11 @@ class NormalizedError:
     cooldownable: bool
     message: str
     provider: str | None = None
+    # A local-configuration fault (e.g. no/invalid endpoint configured) that
+    # surfaced as a status (typically 503). Preserved through normalization so
+    # downstream policy (e.g. Codex-OAuth fallback) can fail closed rather than
+    # treat a misconfiguration as a retryable/fallbackable upstream outage.
+    config_error: bool = False
 
     @property
     def is_context_window(self) -> bool:
@@ -244,6 +249,13 @@ def decide(
     returns RETRY — it falls over instantly (or raises if there is nowhere to
     fall over to), so it cannot consume the retry budget or stall the group.
     """
+    # Local-configuration fault (no/invalid/baked endpoint, missing key): terminal.
+    # Retrying the same deployment or falling over to a sibling cannot fix a
+    # misconfiguration, so surface it immediately. RAISE here also keeps the fault
+    # from masquerading as a transient outage to downstream fallback policy.
+    if getattr(err, "config_error", False):
+        return RetryAction.RAISE
+
     # Context-window / content-policy: a different model may succeed.
     if err.error_class in (ErrorClass.CONTEXT_WINDOW_EXCEEDED, ErrorClass.CONTENT_POLICY):
         return RetryAction.FALLOVER if has_fallbacks else RetryAction.RAISE

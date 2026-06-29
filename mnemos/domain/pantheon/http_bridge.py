@@ -12,6 +12,7 @@ Pure aside from reading attributes off the exception/response.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -33,7 +34,24 @@ def _body_of(exc: BaseException) -> str | None:
 
 
 def classify(exc: BaseException) -> NormalizedError:
-    """Map a raised provider-call exception to a :class:`NormalizedError`."""
+    """Map a raised provider-call exception to a :class:`NormalizedError`.
+
+    A ``config_error`` marker on the source exception (a local-configuration fault
+    such as no/invalid endpoint configured) is preserved on the result and forced
+    terminal — ``retryable=False`` and ``cooldownable=False`` — so downstream
+    policy fails closed instead of treating it as a fallbackable upstream outage.
+    Non-cooldownable matters specifically: if a config fault tripped a cooldown,
+    the misconfigured deployment would be pre-filtered out of later requests, and
+    its ``config_error`` would vanish from the attempt trail — re-opening the
+    fallback-laundering path the config_error guards exist to close.
+    """
+    normalized = _classify(exc)
+    if getattr(exc, "config_error", False):
+        return replace(normalized, config_error=True, retryable=False, cooldownable=False)
+    return normalized
+
+
+def _classify(exc: BaseException) -> NormalizedError:
     # httpx response-bearing error (raise_for_status / status checks).
     if isinstance(exc, httpx.HTTPStatusError):
         resp = exc.response

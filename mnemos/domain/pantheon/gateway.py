@@ -10,6 +10,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -27,40 +28,28 @@ logger = logging.getLogger(__name__)
 _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
 _REASONING_MODEL_RE = re.compile(r"(reason|thinking|r1\b|\bo[134]\b|gpt-5|grok-4|deepseek)", re.I)
 _RESPONSES_MODEL_RE = re.compile(r"(?:^|/)(?:gpt-[0-9.]+.*codex|.*codex.*gpt-[0-9.]|o[134].*-codex|codex)", re.I)
+# Valid endpoint-host characters: DNS labels (alnum, dot, hyphen, underscore) and
+# IPv4 / IPv6-literal characters (urlparse strips IPv6 brackets, leaving colons).
+# Rejects malformed hosts like "%zz" that urlparse/httpx tolerate.
+_VALID_HOST_RE = re.compile(r"[A-Za-z0-9._:\-]+")
 _TOKEN_BUDGET_FIELDS = ("max_output_tokens", "max_completion_tokens", "max_tokens")
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 60.0
+# The gateway CONNECTION is deployment-idempotent: this (public) source declares
+# provider IDENTITY/shape only (which key env var, wire api), never the upstream
+# ENDPOINT URL it dials. The actual connection (``base_url``/``url``) is sourced
+# at runtime — operator config (``mnemos.domain.providers.get_provider_config``),
+# the GRAEAE engine registry (``engine.providers``), or the catalog's
+# ``llm_provider_registry.json`` — merged in ``_provider_config`` below. With no
+# endpoint configured for a provider, ``_provider_config`` raises 503 rather than
+# dialing a baked vendor URL. Same published image → direct provider URLs, a local
+# proxy, or a gateway VIP, purely by config. (The hardcoded NVIDIA/EIH/DeepSeek/
+# codex-oauth endpoint URLs were removed per the image-distribution ADR.)
 _PANTHEON_PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
-    "nvidia": {
-        "url": "https://inference-api.nvidia.com/v1/chat/completions",
-        "api": "openai",
-        "key_name": "nvidia",
-        "enabled": True,
-    },
-    "eih": {
-        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "api": "openai",
-        "key_name": "eih",
-        "enabled": True,
-    },
-    "ngc": {
-        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "api": "openai",
-        "key_name": "ngc",
-        "enabled": True,
-    },
-    "deepseek-direct": {
-        "url": "https://api.deepseek.com/v1/chat/completions",
-        "api": "openai",
-        "key_name": "deepseek-direct",
-        "enabled": True,
-    },
-    "codex-oauth": {
-        "url": "http://127.0.0.1:42617/v1/chat/completions",
-        "api": "openai",
-        "key_name": "codex-oauth",
-        "enabled": False,
-        "fallback_only": True,
-    },
+    "nvidia": {"api": "openai", "key_name": "nvidia", "enabled": True},
+    "eih": {"api": "openai", "key_name": "eih", "enabled": True},
+    "ngc": {"api": "openai", "key_name": "ngc", "enabled": True},
+    "deepseek-direct": {"api": "openai", "key_name": "deepseek-direct", "enabled": True},
+    "codex-oauth": {"api": "openai", "key_name": "codex-oauth", "enabled": False, "fallback_only": True},
 }
 _CODEX_OAUTH_FALLBACK_PROVIDERS = {"eih", "ngc", "nvidia"}
 _CODEX_OAUTH_FALLBACK_STATUSES = {502, 503, 504}
@@ -113,11 +102,22 @@ async def aclose_runtime() -> None:
 
 
 class PantheonGatewayError(Exception):
-    def __init__(self, status_code: int, message: str, retry_after: float | None = None):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        retry_after: float | None = None,
+        *,
+        config_error: bool = False,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.retry_after = retry_after
+        # A local-configuration fault (e.g. no/invalid endpoint configured), not an
+        # upstream outage. Config errors must fail closed: they are NOT eligible for
+        # the Codex-OAuth fallback even though they surface as a 503.
+        self.config_error = config_error
 
 
 @dataclass(frozen=True)
@@ -165,23 +165,111 @@ def _identity_headers(identity: UpstreamIdentity | None) -> dict[str, str]:
     }
 
 
+def _valid_endpoint(value: Any, *, allow_query: bool = False) -> str | None:
+    """Return a whitespace-trimmed endpoint URL iff it is a well-formed http(s) URL.
+
+    Connection endpoints are operator-supplied at runtime, so anything that is not
+    a structurally valid http(s) URL must fail closed — returning ``None`` routes
+    the caller to a clean 503 rather than letting a malformed value reach the HTTP
+    client. This function is TOTAL: it never raises (``urlparse``/``.port`` can
+    raise ``ValueError`` on malformed IPv6 or out-of-range ports), so a bad
+    optional field can never escape as an uncaught exception nor shadow a valid
+    sibling endpoint field in the fail-closed guard.
+
+    Rejected: non-strings; blank/whitespace-only; any internal whitespace or C0
+    control char; non-http(s) scheme; missing host; invalid/out-of-range port; any
+    fragment. A query string is rejected by default because a suffix-expanded base
+    URL would land the query before the appended path and corrupt the URL; pass
+    ``allow_query=True`` for an EXACT endpoint field used verbatim (no suffix
+    appended), e.g. an Azure-style ``...?api-version=...`` chat endpoint.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or any(ch.isspace() or ord(ch) < 0x20 for ch in candidate):
+        return None
+    try:
+        parsed = urlparse(candidate)
+        port = parsed.port  # raises ValueError on a non-numeric / out-of-range port
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    # Strict host charset: urlparse/httpx tolerate malformed hosts like "%zz" that
+    # then surface as transport errors/timeouts (retryable) instead of a clean
+    # config-error 503. Allow only DNS-name / IPv4 / IPv6-literal characters
+    # (urlparse already strips IPv6 brackets, leaving colons in the hostname).
+    if not _VALID_HOST_RE.fullmatch(parsed.hostname):
+        return None
+    if parsed.fragment or (parsed.query and not allow_query):
+        return None
+    if port is not None and not (0 < port <= 65535):
+        return None
+    # Authoritative final gate: the HTTP client itself must accept the URL. This
+    # catches values urlparse tolerates but httpx rejects at request time, e.g.
+    # invalid IP literals like "http://[v1.fe80::1]/v1" (InvalidURL) — fail closed
+    # to a clean 503 rather than letting it reach client.post/stream.
+    try:
+        httpx.URL(candidate)
+    except Exception:
+        return None
+    return candidate
+
+
 def _provider_config(decision: RouteDecision) -> dict[str, Any]:
     engine = get_graeae_engine()
     defaults = _PANTHEON_PROVIDER_DEFAULTS.get(decision.provider, {})
     provider_cfg = dict(engine.providers.get(decision.provider, {}))
+    # A graeae builtin-fallback provider (used when config.toml has no
+    # [graeae.providers]) carries baked vendor URLs. Those are NOT an idempotent
+    # connection endpoint, so strip its endpoint fields before the merge: only an
+    # operator-supplied endpoint (an engine provider loaded from config.toml, or
+    # get_provider_config) may satisfy the fail-closed guard below. graeae's own
+    # consensus path still uses the builtin URLs — this governs the gateway only.
+    # Forward-compatible: a no-op until graeae tags fallback providers
+    # `_source="builtin"`.
+    if str(provider_cfg.get("_source") or "").strip().lower() == "builtin":
+        for _endpoint_field in ("base_url", "url", "chat_url", "responses_url", "embeddings_url"):
+            provider_cfg.pop(_endpoint_field, None)
     try:
         operator_cfg = {k: v for k, v in get_provider_config(decision.provider).items() if k != "api_key"}
     except Exception:
         operator_cfg = {}
     cfg = {**defaults, **provider_cfg, **operator_cfg}
     if not cfg:
-        raise PantheonGatewayError(503, f"provider {decision.provider!r} is not registered")
-    if cfg.get("base_url"):
-        base_url = _base_v1_url(str(cfg["base_url"]))
-        cfg["url"] = base_url + "/chat/completions"
-        cfg["chat_url"] = base_url + "/chat/completions"
-        cfg["responses_url"] = base_url + "/responses"
-        cfg["embeddings_url"] = base_url + "/embeddings"
+        # An unregistered provider is a local deployment-config fault: terminal and
+        # non-fallbackable (config_error), consistent with the no-endpoint guard.
+        raise PantheonGatewayError(503, f"provider {decision.provider!r} is not registered", config_error=True)
+    base_url = _valid_endpoint(cfg.get("base_url"))
+    if base_url:
+        normalized = _base_v1_url(base_url)
+        cfg["url"] = normalized + "/chat/completions"
+        cfg["chat_url"] = normalized + "/chat/completions"
+        cfg["responses_url"] = normalized + "/responses"
+        cfg["embeddings_url"] = normalized + "/embeddings"
+    # Connection endpoints are not baked (idempotent): a provider declared in
+    # source carries identity only, so a deployment that registered no usable
+    # endpoint fails closed here rather than POSTing to an empty/malformed URL.
+    # Validation is structural (http(s) scheme + host), not truthiness — a
+    # whitespace or scheme-less value does not count. Any valid endpoint field
+    # counts (incl. endpoint-specific responses_url/embeddings_url-only configs);
+    # the per-endpoint helper (_chat_url/_responses_url/_embeddings_url) raises
+    # its own 503 if the specific endpoint it needs cannot be resolved.
+    #
+    # The requirement applies ONLY to OpenAI-compatible HTTP providers. Providers
+    # that route through Graeae (api != "openai", e.g. "gemini") dispatch on
+    # `api` in forward_chat_completion/stream_chat_completion without an HTTP URL,
+    # so requiring an endpoint here would wrongly reject them.
+    if cfg.get("api", "openai") == "openai" and not (
+        _valid_endpoint(cfg.get("base_url"))
+        or _valid_endpoint(cfg.get("url"))
+        or _valid_endpoint(cfg.get("chat_url"), allow_query=True)
+        or _valid_endpoint(cfg.get("responses_url"), allow_query=True)
+        or _valid_endpoint(cfg.get("embeddings_url"), allow_query=True)
+    ):
+        raise PantheonGatewayError(
+            503, f"provider {decision.provider!r} has no endpoint configured", config_error=True
+        )
     if decision.model_id:
         cfg["model"] = decision.model_id
     return cfg
@@ -191,7 +279,12 @@ def _auth_headers(cfg: dict[str, Any], identity: UpstreamIdentity | None = None)
     key_name = cfg.get("key_name")
     api_key = get_key(str(key_name or ""))
     if not api_key:
-        raise PantheonGatewayError(503, f"missing api_key for provider key_name={key_name!r}")
+        # Missing local credential is a deployment-config fault, not an upstream
+        # outage: fail closed (terminal, non-fallbackable) rather than laundering
+        # it into a Codex-OAuth fallback for eih/ngc/nvidia.
+        raise PantheonGatewayError(
+            503, f"missing api_key for provider key_name={key_name!r}", config_error=True
+        )
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -247,27 +340,52 @@ def model_needs_reasoning_budget(model_id: str | None) -> bool:
 
 
 def _base_v1_url(url: str) -> str:
+    # Trim trailing slashes BEFORE matching suffixes: a base_url like
+    # "https://h/v1/chat/completions/" must normalize to "https://h/v1" rather than
+    # round-tripping into "https://h/v1/chat/completions/chat/completions".
+    url = url.rstrip("/")
     for suffix in ("/chat/completions", "/responses", "/embeddings"):
         if url.endswith(suffix):
             return url[: -len(suffix)]
-    return url.rstrip("/")
+    return url
+
+
+def _resolve_endpoint(cfg: dict[str, Any], *, exact_field: str, suffix: str, what: str) -> str:
+    """Resolve a concrete upstream endpoint URL, fail-closed.
+
+    Precedence (preserves the historical ``base_url > <specific> > url`` order):
+    a generic ``base_url`` is suffix-expanded (``base_url + suffix``); an explicit
+    endpoint-specific field (``chat_url``/``responses_url``/``embeddings_url``) is
+    the EXACT endpoint and is used VERBATIM — never re-suffixed, so an operator's
+    non-standard path (e.g. ``https://h/custom-chat``) is not mutated into
+    ``.../custom-chat/chat/completions``; a generic ``url`` is suffix-expanded.
+    Raises a config-error 503 if none resolves.
+    """
+    base = _valid_endpoint(cfg.get("base_url"))
+    if base:
+        return _base_v1_url(base) + suffix
+    # Exact endpoint field: used verbatim (no suffix), so a query string is valid.
+    exact = _valid_endpoint(cfg.get(exact_field), allow_query=True)
+    if exact:
+        return exact
+    url = _valid_endpoint(cfg.get("url"))
+    if url:
+        return _base_v1_url(url) + suffix
+    raise PantheonGatewayError(503, f"provider has no {what} endpoint configured", config_error=True)
 
 
 def _chat_url(cfg: dict[str, Any], decision: RouteDecision) -> str:
     if model_uses_responses_api(decision.model_id):
         return _responses_url(cfg)
-    url = str(cfg.get("base_url") or cfg.get("chat_url") or cfg.get("url") or "")
-    return _base_v1_url(url) + "/chat/completions"
+    return _resolve_endpoint(cfg, exact_field="chat_url", suffix="/chat/completions", what="chat")
 
 
 def _responses_url(cfg: dict[str, Any]) -> str:
-    url = str(cfg.get("base_url") or cfg.get("responses_url") or cfg.get("url") or "")
-    return _base_v1_url(url) + "/responses"
+    return _resolve_endpoint(cfg, exact_field="responses_url", suffix="/responses", what="responses")
 
 
 def _embeddings_url(cfg: dict[str, Any]) -> str:
-    url = str(cfg.get("base_url") or cfg.get("embeddings_url") or cfg.get("url") or "")
-    return _base_v1_url(url) + "/embeddings"
+    return _resolve_endpoint(cfg, exact_field="embeddings_url", suffix="/embeddings", what="embeddings")
 
 
 def _reasoning_budget() -> int:
@@ -456,6 +574,18 @@ def set_runtime(runtime: RouterRuntime | None) -> None:
 def _is_openai_api(decision: RouteDecision) -> bool:
     try:
         return _provider_config(decision).get("api", "openai") == "openai"
+    except PantheonGatewayError as exc:
+        # Fail closed, do not silently drop: a config-faulted candidate (no/invalid
+        # endpoint, unregistered, missing key) is KEPT in the runtime chain so it
+        # fails terminally when attempted (decide()->RAISE) and its config_error is
+        # recorded in the attempt trail — which blocks Codex-OAuth fallback
+        # laundering and surfaces the misconfiguration. Dropping it would hide the
+        # fault. A correctly-configured deployment never config-faults here, and a
+        # healthy primary short-circuits before a faulted fallback is attempted, so
+        # this does not reduce availability for valid configs.
+        if getattr(exc, "config_error", False):
+            return True
+        return False
     except Exception:
         return False
 
@@ -553,6 +683,10 @@ def _codex_oauth_fallback_trigger(decision: RouteDecision, exc: BaseException | 
         return False
     if exc is None:
         return False
+    # Local config faults (no/invalid endpoint configured) surface as 503 but must
+    # fail closed — never launder a misconfiguration into a Codex-OAuth fallback.
+    if getattr(exc, "config_error", False):
+        return False
     if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
         return True
     status = getattr(exc, "status_code", None)
@@ -560,6 +694,8 @@ def _codex_oauth_fallback_trigger(decision: RouteDecision, exc: BaseException | 
 
 
 def _codex_oauth_normalized_failure_trigger(err: Any) -> bool:
+    if getattr(err, "config_error", False):
+        return False
     status = getattr(err, "status_code", None)
     if isinstance(status, int) and status in _CODEX_OAUTH_FALLBACK_STATUSES:
         return True
@@ -569,6 +705,15 @@ def _codex_oauth_normalized_failure_trigger(err: Any) -> bool:
 
 
 def _codex_oauth_route_failure_trigger(primary: RouteDecision, failure: AllDeploymentsFailed) -> bool:
+    # Fail closed first: a local config fault ANYWHERE in the attempt trail (or the
+    # last exception) makes the whole route ineligible for fallback, regardless of
+    # target-provider filtering. Without this, a genuine eih/ngc/nvidia 503 paired
+    # with a later non-target config-error attempt could still pass the target
+    # `all(...)` and launder a misconfiguration into fallback traffic.
+    if getattr(failure.last_exception, "config_error", False):
+        return False
+    if any(getattr(attempt.error, "config_error", False) for attempt in failure.attempts):
+        return False
     target_attempts = [
         attempt
         for attempt in failure.attempts
@@ -669,6 +814,56 @@ async def _yield_openai_chat_stream(opened: _OpenChatStream) -> AsyncIterator[by
             yield chunk
     finally:
         await opened.aclose()
+
+
+async def preflight_chat_endpoint(decision: RouteDecision) -> None:
+    """Eagerly resolve the upstream connection for a (possibly streaming) chat call.
+
+    A streaming response body is an async generator iterated AFTER the route
+    returns its ``StreamingResponse`` — so a connection-config fault raised lazily
+    inside :func:`stream_chat_completion` would escape the route's
+    ``PantheonGatewayError`` handler and abort an already-200 stream instead of
+    failing closed. Awaiting this inside the route's try-block surfaces a
+    misconfiguration as a clean 503 before the stream starts.
+
+    Validates every deployment that can ACTUALLY execute: the raw primary plus the
+    cross-provider fallback chain returned by :func:`_runtime_chain`. For each
+    OpenAI-compatible deployment it resolves the concrete endpoint (``_chat_url``,
+    raises 503 if absent) and the credential (``_auth_headers``, raises a
+    config-error 503 if the api_key is missing). No-op for consensus and
+    Graeae-routed (api != "openai") deployments, which use no HTTP endpoint.
+
+    Coverage: ``_is_openai_api`` keeps a config-faulted candidate IN the chain
+    (rather than dropping it), so iterating the chain here validates every
+    deployment that can actually be attempted — a misconfigured fallback fails
+    closed up front instead of aborting a 200 stream when it is reached at
+    runtime. The raw primary is also resolved directly because
+    ``stream_chat_completion`` dispatches on ``_provider_config(decision)`` before
+    building the chain.
+    """
+    if decision.route_type == "consensus":
+        return
+    # Validate the RAW primary exactly as stream_chat_completion dispatches it: the
+    # stream resolves _provider_config(decision) DIRECTLY (to pick openai vs
+    # Graeae) before building the runtime chain. _runtime_chain()'s _is_openai_api
+    # filter silently drops a config-faulted deployment, so a misconfigured primary
+    # would be absent from the chain and resurface lazily mid-stream unless checked
+    # here against the raw decision.
+    cfg = _provider_config(decision)
+    if cfg.get("api", "openai") != "openai":
+        return  # Graeae-routed: the stream uses no HTTP endpoint and no chain
+    _chat_url(cfg, decision)
+    _auth_headers(cfg)
+    # Then validate the fallback deployments that can actually execute. Entries in
+    # the runtime chain already passed _provider_config via the filter, but
+    # _chat_url can still 503 for an endpoint-specific-only config (e.g. a provider
+    # configured with embeddings_url only but routed a chat request).
+    for dep in await _runtime_chain(decision):
+        dep_cfg = _provider_config(dep)
+        if dep_cfg.get("api", "openai") != "openai":
+            continue
+        _chat_url(dep_cfg, dep)
+        _auth_headers(dep_cfg)
 
 
 async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
