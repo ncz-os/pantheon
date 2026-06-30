@@ -1094,7 +1094,10 @@ def test_upstream_timeout_cools_primary_and_falls_back(monkeypatch):
     assert store.get_cooled_until("_default", "openai:gpt-5.4") == 1005.0
 
 
-def test_eih_and_deepseek_direct_defaults_forward(monkeypatch):
+def test_configured_providers_forward_to_their_base_url(monkeypatch):
+    # Connection is deployment-idempotent: provider endpoints come from operator
+    # config (get_provider_config), NOT a baked default table. Two arbitrary
+    # providers configured with neutral base_urls must forward to exactly those.
     monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
     posted: list[tuple[str, dict]] = []
 
@@ -1118,29 +1121,346 @@ def test_eih_and_deepseek_direct_defaults_forward(monkeypatch):
             posted.append((url, kwargs["json"]))
             return _Resp(kwargs["json"]["model"])
 
-    monkeypatch.setattr(gateway, "get_provider_config", lambda _provider: {})
+    configured = {
+        "provider-a": {"base_url": "https://provider-a.test/v1", "api": "openai", "key_name": "provider-a"},
+        "provider-b": {"base_url": "https://provider-b.test/v1", "api": "openai", "key_name": "provider-b"},
+    }
+    monkeypatch.setattr(gateway, "get_provider_config", lambda provider: dict(configured.get(provider, {})))
     monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
     monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
 
-    eih = asyncio.run(
+    a = asyncio.run(
         gateway._forward_chat_once(
-            _decision(provider="eih", model_id="nvidia/llama-3.3-70b-instruct", route_type="literal"),
+            _decision(provider="provider-a", model_id="model-a", route_type="literal"),
             {"messages": [{"role": "user", "content": "hi"}]},
         )
     )
-    deepseek = asyncio.run(
+    b = asyncio.run(
         gateway._forward_chat_once(
-            _decision(provider="deepseek-direct", model_id="deepseek-v4-flash", route_type="literal"),
+            _decision(provider="provider-b", model_id="model-b", route_type="literal"),
             {"messages": [{"role": "user", "content": "hi"}]},
         )
     )
 
-    assert eih["model"] == "nvidia/llama-3.3-70b-instruct"
-    assert deepseek["model"] == "deepseek-v4-flash"
-    assert posted[0][0] == "https://integrate.api.nvidia.com/v1/chat/completions"
-    assert posted[0][1]["model"] == "nvidia/llama-3.3-70b-instruct"
-    assert posted[1][0] == "https://api.deepseek.com/v1/chat/completions"
-    assert posted[1][1]["model"] == "deepseek-v4-flash"
+    assert a["model"] == "model-a"
+    assert b["model"] == "model-b"
+    assert posted[0][0] == "https://provider-a.test/v1/chat/completions"
+    assert posted[0][1]["model"] == "model-a"
+    assert posted[1][0] == "https://provider-b.test/v1/chat/completions"
+    assert posted[1][1]["model"] == "model-b"
+
+
+def test_provider_without_endpoint_raises_clean_503(monkeypatch):
+    # Connection idempotency, fail-closed: when neither operator config nor the
+    # engine supplies an endpoint for the routed provider, the gateway must raise
+    # a clean 503 (no endpoint configured) rather than fall back to a baked URL.
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_provider_config", lambda provider: {})
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+
+    with pytest.raises(gateway.PantheonGatewayError) as excinfo:
+        asyncio.run(
+            gateway._forward_chat_once(
+                _decision(provider="nvidia", model_id="model-x", route_type="literal"),
+                {"messages": [{"role": "user", "content": "hi"}]},
+            )
+        )
+    assert excinfo.value.status_code == 503
+    assert "endpoint" in str(excinfo.value).lower()
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "   ",
+        "localhost:8000/v1",  # no scheme
+        "ftp://h/v1",  # wrong scheme
+        "not a url",
+        "/v1",  # no host
+        "http:///v1",  # empty host
+        "http://h /v1",  # internal whitespace
+        "http://h\t/v1",  # control whitespace
+        "http://h:99999/v1",  # out-of-range port -> .port raises ValueError
+        "http://[::1/v1",  # malformed IPv6 -> urlparse/.port raises ValueError
+        "https://api.test/v1?x=1",  # query -> path append would corrupt the URL
+        "https://api.test/v1#frag",  # fragment -> path append would corrupt the URL
+        "http://[v1.fe80::1]/v1",  # invalid IP literal urlparse tolerates but httpx rejects
+        "http://%zz/v1",  # malformed host charset urlparse/httpx tolerate
+    ],
+)
+def test_provider_with_malformed_endpoint_raises_clean_503(monkeypatch, bad_url):
+    # Fail-closed validation is structural and TOTAL: any non-well-formed http(s)
+    # value (whitespace, no scheme/host, bad port, malformed IPv6) must produce a
+    # clean 503 -- never an uncaught ValueError, never a malformed URL at the HTTP
+    # client.
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(
+        gateway,
+        "get_provider_config",
+        lambda provider: {"base_url": bad_url, "api": "openai", "key_name": "nvidia"},
+    )
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+
+    with pytest.raises(gateway.PantheonGatewayError) as excinfo:
+        asyncio.run(
+            gateway._forward_chat_once(
+                _decision(provider="nvidia", model_id="model-x", route_type="literal"),
+                {"messages": [{"role": "user", "content": "hi"}]},
+            )
+        )
+    assert excinfo.value.status_code == 503
+
+
+def test_malformed_base_url_does_not_shadow_valid_chat_url(monkeypatch):
+    # A malformed optional base_url must not block a valid sibling endpoint field:
+    # _valid_endpoint is total, so the guard falls through to the good chat_url.
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(
+        gateway,
+        "get_provider_config",
+        lambda provider: {
+            "base_url": "http://[::1/v1",  # malformed -> ignored
+            "chat_url": "https://good.test/v1/chat/completions",
+            "api": "openai",
+            "key_name": "nvidia",
+        },
+    )
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+    posted: list[str] = []
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"id": "x", "model": "model-x", "choices": [], "usage": {}}
+
+    class _Client:
+        async def post(self, url, **kwargs):
+            posted.append(url)
+            return _Resp()
+
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    asyncio.run(
+        gateway._forward_chat_once(
+            _decision(provider="nvidia", model_id="model-x", route_type="literal"),
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+    assert posted == ["https://good.test/v1/chat/completions"]
+
+
+def test_graeae_routed_provider_without_endpoint_is_not_rejected(monkeypatch):
+    # Regression guard: the no-endpoint 503 applies ONLY to OpenAI-compatible HTTP
+    # providers. A Graeae-routed provider (api != "openai", e.g. "gemini") has no
+    # HTTP base_url/url and dispatches on `api`; _provider_config must return its
+    # cfg without raising.
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_provider_config", lambda provider: {"api": "gemini"})
+
+    cfg = gateway._provider_config(_decision(provider="gemini", model_id="gemini-2.5-pro", route_type="literal"))
+    assert cfg["api"] == "gemini"
+    assert cfg["model"] == "gemini-2.5-pro"
+
+
+def test_builtin_fallback_url_is_not_an_idempotent_endpoint(monkeypatch):
+    # A graeae builtin-fallback provider (tagged _source="builtin") carries baked
+    # vendor URLs that must NOT count as a configured connection endpoint: with no
+    # operator config, the openai provider fails closed with a clean 503.
+    monkeypatch.setattr(
+        gateway,
+        "get_graeae_engine",
+        lambda: SimpleNamespace(
+            providers={
+                "nvidia": {
+                    "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+                    "api": "openai",
+                    "key_name": "nvidia",
+                    "_source": "builtin",
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(gateway, "get_provider_config", lambda provider: {})
+
+    with pytest.raises(gateway.PantheonGatewayError) as excinfo:
+        gateway._provider_config(_decision(provider="nvidia", model_id="m", route_type="literal"))
+    assert excinfo.value.status_code == 503
+
+
+def test_config_toml_engine_endpoint_is_honored(monkeypatch):
+    # An engine provider WITHOUT the builtin tag (i.e. loaded from config.toml) is
+    # legitimate operator config: its endpoint is honored, no 503.
+    monkeypatch.setattr(
+        gateway,
+        "get_graeae_engine",
+        lambda: SimpleNamespace(
+            providers={"nvidia": {"url": "https://op.test/v1/chat/completions", "api": "openai", "key_name": "nvidia"}}
+        ),
+    )
+    monkeypatch.setattr(gateway, "get_provider_config", lambda provider: {})
+
+    cfg = gateway._provider_config(_decision(provider="nvidia", model_id="m", route_type="literal"))
+    assert gateway._chat_url(cfg, _decision(provider="nvidia", model_id="m")) == "https://op.test/v1/chat/completions"
+
+
+def test_builtin_fallback_url_overridden_by_operator_config(monkeypatch):
+    # If the operator re-supplies an endpoint via get_provider_config, that wins
+    # even when the engine entry is a builtin fallback.
+    monkeypatch.setattr(
+        gateway,
+        "get_graeae_engine",
+        lambda: SimpleNamespace(
+            providers={
+                "nvidia": {
+                    "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+                    "api": "openai",
+                    "key_name": "nvidia",
+                    "_source": "builtin",
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(gateway, "get_provider_config", lambda provider: {"base_url": "https://op.test/v1"})
+
+    cfg = gateway._provider_config(_decision(provider="nvidia", model_id="m", route_type="literal"))
+    assert gateway._chat_url(cfg, _decision(provider="nvidia", model_id="m")) == "https://op.test/v1/chat/completions"
+
+
+def test_endpoint_specific_field_used_verbatim():
+    # An explicit endpoint-specific field is the EXACT endpoint URL and must be
+    # used verbatim, NOT suffix-mutated (only base_url/url get suffix expansion).
+    assert (
+        gateway._chat_url({"chat_url": "https://x.test/custom-chat", "api": "openai"}, _decision(model_id="m"))
+        == "https://x.test/custom-chat"
+    )
+    assert (
+        gateway._responses_url({"responses_url": "https://x.test/custom-r", "api": "openai"})
+        == "https://x.test/custom-r"
+    )
+    assert (
+        gateway._embeddings_url({"embeddings_url": "https://x.test/custom-emb", "api": "openai"})
+        == "https://x.test/custom-emb"
+    )
+    # base_url is still suffix-expanded.
+    assert (
+        gateway._chat_url({"base_url": "https://x.test/v1"}, _decision(model_id="m"))
+        == "https://x.test/v1/chat/completions"
+    )
+
+
+def test_base_url_trailing_slash_and_full_path_normalize_correctly():
+    # Trailing slashes are trimmed before suffix matching, so neither a trailing
+    # slash nor a full-path base_url round-trips into a doubled path.
+    assert (
+        gateway._chat_url({"base_url": "https://x.test/v1/"}, _decision(model_id="m"))
+        == "https://x.test/v1/chat/completions"
+    )
+    assert (
+        gateway._chat_url({"base_url": "https://x.test/v1/chat/completions/"}, _decision(model_id="m"))
+        == "https://x.test/v1/chat/completions"
+    )
+    assert (
+        gateway._responses_url({"base_url": "https://x.test/v1/chat/completions/"})
+        == "https://x.test/v1/responses"
+    )
+
+
+def test_exact_endpoint_field_allows_query_string():
+    # An exact endpoint field is used verbatim, so a query string (e.g. Azure
+    # ?api-version=...) is valid and preserved. base_url/url (suffix-expanded) still
+    # reject a query that would corrupt the appended path.
+    azure = "https://h.openai.azure.com/openai/deployments/gpt/chat/completions?api-version=2026-01-01"
+    assert gateway._chat_url({"chat_url": azure, "api": "openai"}, _decision(model_id="m")) == azure
+    assert gateway._valid_endpoint("https://h/v1?x=1") is None  # base/url path: rejected
+    assert gateway._valid_endpoint("https://h/v1?x=1", allow_query=True) == "https://h/v1?x=1"
+
+
+def test_preflight_chat_endpoint_fails_closed_before_stream(monkeypatch):
+    # Streaming bodies iterate lazily after the route returns StreamingResponse,
+    # so the endpoint must be resolved eagerly: preflight raises a clean 503 for
+    # an OpenAI-compatible provider with no configured endpoint.
+    async def _chain(d):
+        return [d]
+
+    monkeypatch.setattr(gateway, "_runtime_chain", _chain)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_provider_config", lambda provider: {})
+
+    with pytest.raises(gateway.PantheonGatewayError) as excinfo:
+        asyncio.run(gateway.preflight_chat_endpoint(_decision(provider="nvidia", model_id="m", route_type="literal")))
+    assert excinfo.value.status_code == 503
+
+
+def test_preflight_chat_endpoint_noop_for_consensus_and_graeae(monkeypatch):
+    # Consensus and Graeae-routed (api != "openai") providers use no HTTP endpoint;
+    # preflight must NOT raise for them even with no endpoint configured.
+    async def _chain(d):
+        return [d]
+
+    monkeypatch.setattr(gateway, "_runtime_chain", _chain)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(gateway, "get_provider_config", lambda provider: {"api": "gemini"})
+
+    asyncio.run(gateway.preflight_chat_endpoint(_decision(provider="p", model_id="m", route_type="consensus")))
+    asyncio.run(
+        gateway.preflight_chat_endpoint(_decision(provider="gemini", model_id="gemini-2.5-pro", route_type="literal"))
+    )
+
+
+def test_preflight_validates_entire_fallback_chain(monkeypatch):
+    # The streaming preflight must validate every reachable deployment: a healthy
+    # primary with a MISCONFIGURED cross-provider fallback (no endpoint) fails
+    # closed up front rather than aborting a 200 stream when the fallback is hit.
+    primary = _decision(provider="nvidia", model_id="m", route_type="literal")
+    bad_fallback = _decision(provider="deepseek-direct", model_id="m2", route_type="literal")
+
+    async def fake_chain(_decision):
+        return [primary, bad_fallback]
+
+    monkeypatch.setattr(gateway, "_runtime_chain", fake_chain)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(
+        gateway,
+        "get_provider_config",
+        lambda provider: {"base_url": "https://ok.test/v1", "api": "openai", "key_name": "nvidia"}
+        if provider == "nvidia"
+        else {},  # deepseek-direct: no endpoint -> config fault
+    )
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+
+    with pytest.raises(gateway.PantheonGatewayError) as excinfo:
+        asyncio.run(gateway.preflight_chat_endpoint(primary))
+    assert excinfo.value.status_code == 503
+
+
+def test_preflight_catches_misconfigured_primary_even_when_chain_omits_it(monkeypatch):
+    # stream_chat_completion resolves _provider_config(decision) on the RAW primary
+    # before building the chain, so preflight must validate the raw decision
+    # directly (mirroring it) — not rely on the chain containing the primary —
+    # otherwise a misconfigured primary resurfaces lazily mid-stream.
+    primary = _decision(provider="nvidia", model_id="m", route_type="literal")
+    healthy_sibling = _decision(provider="deepseek-direct", model_id="m2", route_type="literal")
+
+    async def fake_chain(_decision):
+        # Chain omits the primary; preflight must still fail closed on the raw
+        # primary decision.
+        return [healthy_sibling]
+
+    monkeypatch.setattr(gateway, "_runtime_chain", fake_chain)
+    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(
+        gateway,
+        "get_provider_config",
+        lambda provider: {}  # primary (nvidia): misconfigured, no endpoint
+        if provider == "nvidia"
+        else {"base_url": "https://ok.test/v1", "api": "openai", "key_name": "deepseek-direct"},
+    )
+    monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
+
+    with pytest.raises(gateway.PantheonGatewayError) as excinfo:
+        asyncio.run(gateway.preflight_chat_endpoint(primary))
+    assert excinfo.value.status_code == 503
 
 
 def test_model_label_correctness_uses_response_wire_model():
@@ -1278,7 +1598,13 @@ def test_unknown_explicit_model_routes_through_budget_cooldown_and_audit(monkeyp
     monkeypatch.setattr(catalog, "list_models", _models)
     monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings())
     monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
-    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(
+        gateway,
+        "get_graeae_engine",
+        lambda: SimpleNamespace(
+            providers={"nvidia": {"base_url": "https://passthrough.test/v1", "api": "openai", "key_name": "nvidia"}}
+        ),
+    )
     monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
     monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
     gateway.set_runtime(runtime)
@@ -1310,7 +1636,7 @@ def test_unknown_explicit_model_routes_through_budget_cooldown_and_audit(monkeyp
 
     assert response.status_code == 200
     assert budget_calls and budget_calls[0]["caller_subsystem"] == "pantheon"
-    assert posted[0][0] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted[0][0] == "https://passthrough.test/v1/chat/completions"
     assert posted[0][1]["model"] == explicit_model
     assert posted[0][1]["messages"] == [{"role": "user", "content": "hi"}]
     assert posted[0][1]["user"] == "mnemos:bb82030dbc2bcaba"
@@ -1360,7 +1686,13 @@ def test_unknown_explicit_embedding_model_uses_runtime_and_audit(monkeypatch):
     monkeypatch.setattr(catalog, "list_models", _models)
     monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings())
     monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
-    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(
+        gateway,
+        "get_graeae_engine",
+        lambda: SimpleNamespace(
+            providers={"nvidia": {"base_url": "https://passthrough.test/v1", "api": "openai", "key_name": "nvidia"}}
+        ),
+    )
     monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
     monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
     gateway.set_runtime(RouterRuntime(CooldownManager(store), clock=lambda: 1000.0))
@@ -1394,7 +1726,7 @@ def test_unknown_explicit_embedding_model_uses_runtime_and_audit(monkeypatch):
 
     assert response.status_code == 200
     assert budget_calls
-    assert posted[0][0] == "https://inference-api.nvidia.com/v1/embeddings"
+    assert posted[0][0] == "https://passthrough.test/v1/embeddings"
     assert posted[0][1]["model"] == explicit_model
     assert posted[0][1]["input"] == "hello"
     assert store.get_counts("ns1:u1", f"nvidia:{explicit_model}", 16) == (1, 0)
@@ -1533,6 +1865,14 @@ def test_free_nvidia_passthrough_zero_estimate_is_not_pre_denied(monkeypatch):
     monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings(provider="nvidia"))
     monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
     monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    # Connection endpoint comes from runtime operator config, not a baked default.
+    monkeypatch.setattr(
+        gateway,
+        "get_provider_config",
+        lambda provider: {"base_url": "https://inference-api.nvidia.com/v1", "api": "openai", "key_name": "nvidia"}
+        if provider == "nvidia"
+        else {},
+    )
     monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
     monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
     monkeypatch.setattr(
@@ -1616,7 +1956,13 @@ def test_unknown_explicit_model_streaming_passthrough(monkeypatch):
     monkeypatch.setattr(catalog, "list_models", _models)
     monkeypatch.setattr(router, "get_settings", lambda: _passthrough_router_settings())
     monkeypatch.setattr(gateway, "get_settings", _passthrough_gateway_settings)
-    monkeypatch.setattr(gateway, "get_graeae_engine", lambda: SimpleNamespace(providers={}))
+    monkeypatch.setattr(
+        gateway,
+        "get_graeae_engine",
+        lambda: SimpleNamespace(
+            providers={"nvidia": {"base_url": "https://passthrough.test/v1", "api": "openai", "key_name": "nvidia"}}
+        ),
+    )
     monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
     monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
     gateway.set_runtime(RouterRuntime(CooldownManager(InMemoryCooldownStore()), clock=lambda: 1000.0))
@@ -1655,7 +2001,7 @@ def test_unknown_explicit_model_streaming_passthrough(monkeypatch):
         gateway.set_runtime(None)
 
     assert chunks[-1] == b"data: [DONE]\n\n"
-    assert posted[0][0] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted[0][0] == "https://passthrough.test/v1/chat/completions"
     assert posted[0][1]["model"] == explicit_model
     assert posted[0][1]["stream_options"] == {"include_usage": True}
     assert scheduled[0][0]["resolved_to"] == explicit_model

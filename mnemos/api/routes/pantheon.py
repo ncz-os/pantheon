@@ -633,6 +633,13 @@ async def _chat_completions_impl(
         started_at = time.perf_counter()
         forward_body = gateway.attach_upstream_identity(body, identity)
         if body.get("stream") is True:
+            # Fail closed BEFORE returning the StreamingResponse: the stream body
+            # is iterated lazily by Starlette after this handler returns, outside
+            # the PantheonGatewayError handler below, so a connection-config fault
+            # (on the primary OR any fallback deployment) must be surfaced eagerly
+            # here to become a clean 503 (not a 200 that aborts mid-stream).
+            await gateway.preflight_chat_endpoint(decision)
+
             async def audited_stream():
                 stream_buffer = ""
                 wire_model: str | None = None

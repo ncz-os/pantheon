@@ -201,6 +201,149 @@ def test_codex_oauth_fallback_does_not_launder_primary_400_through_later_503(mon
     assert ei.value.status_code == 503
 
 
+def test_codex_oauth_fallback_does_not_run_on_config_error_503(monkeypatch):
+    # A local config fault (no endpoint configured) surfaces as 503 from a helper
+    # inside _forward_chat_once, but must fail closed: the Codex-OAuth fallback
+    # must NOT launder a misconfiguration into a live call, even for a
+    # fallback-eligible provider (eih).
+    _force_openai(monkeypatch)
+
+    async def fake_chain(_decision):
+        return [_eih_decision()]
+
+    async def fake_primary(_decision, _body):
+        raise PantheonGatewayError(503, "provider has no chat endpoint configured", config_error=True)
+
+    async def fake_codex(_decision, _body):
+        raise AssertionError("Codex OAuth fallback must not run on a local config error")
+
+    monkeypatch.setattr(gateway, "_runtime_chain", fake_chain)
+    monkeypatch.setattr(gateway, "_forward_chat_once", fake_primary)
+    monkeypatch.setattr(codex_oauth, "forward_chat_completion", fake_codex)
+
+    with pytest.raises(PantheonGatewayError) as ei:
+        asyncio.run(forward_chat_completion(_eih_decision(), {"messages": []}))
+    assert ei.value.status_code == 503
+    assert ei.value.config_error is True
+
+
+def test_classify_preserves_config_error_through_normalization():
+    # The config_error marker must survive classify() so it is not lost when the
+    # runtime records an AttemptRecord (a NormalizedError) for a failed deployment.
+    from mnemos.domain.pantheon.http_bridge import classify
+
+    cfg_err = classify(PantheonGatewayError(503, "provider has no chat endpoint configured", config_error=True))
+    assert cfg_err.config_error is True
+    assert cfg_err.status_code == 503
+
+    outage = classify(PantheonGatewayError(503, "upstream down"))
+    assert outage.config_error is False
+
+
+def test_route_failure_trigger_rejects_normalized_config_error_attempt():
+    # The target-attempts path (eih/ngc/nvidia) reads NormalizedError off
+    # AttemptRecord, NOT the original exception. A config-error attempt there must
+    # still block the Codex-OAuth fallback.
+    from types import SimpleNamespace
+
+    from mnemos.domain.pantheon.errors import ErrorClass, NormalizedError, RetryAction
+    from mnemos.domain.pantheon.fallback import AllDeploymentsFailed, AttemptRecord
+
+    def _failure(config_error: bool) -> AllDeploymentsFailed:
+        err = NormalizedError(
+            ErrorClass.SERVICE_UNAVAILABLE, 503, True, True, "no endpoint", provider="eih", config_error=config_error
+        )
+        record = AttemptRecord(SimpleNamespace(provider="eih"), err, RetryAction.FALLOVER, 0)
+        return AllDeploymentsFailed([record], last_exception=None)
+
+    # config-error attempt -> NOT eligible for fallback (fail closed)
+    assert gateway._codex_oauth_route_failure_trigger(_eih_decision(), _failure(True)) is False
+    # genuine outage attempt -> eligible (unchanged behavior)
+    assert gateway._codex_oauth_route_failure_trigger(_eih_decision(), _failure(False)) is True
+
+
+def test_config_error_is_terminal_no_fallover():
+    # A config_error is terminal in decide(): never RETRY, never FALLOVER, even
+    # with healthy siblings available. Surfaces immediately so the gateway fails
+    # closed instead of masquerading as a transient outage.
+    from mnemos.domain.pantheon.errors import ErrorClass, NormalizedError, RetryAction, decide
+
+    cfg_err = NormalizedError(ErrorClass.SERVICE_UNAVAILABLE, 503, True, True, "no endpoint", config_error=True)
+    assert decide(cfg_err, num_deployments=3, has_fallbacks=True) is RetryAction.RAISE
+
+    # Control: a genuine 503 outage with siblings still falls over (unchanged).
+    outage = NormalizedError(ErrorClass.SERVICE_UNAVAILABLE, 503, True, True, "down")
+    assert decide(outage, num_deployments=3, has_fallbacks=True) is not RetryAction.RAISE
+
+
+def test_missing_api_key_is_config_error_and_blocks_fallback():
+    # A missing local credential is a config fault: it must carry config_error and
+    # therefore be ineligible for the Codex-OAuth fallback after normalization.
+    from mnemos.domain.pantheon.http_bridge import classify
+
+    err = PantheonGatewayError(503, "missing api_key for provider key_name='nvidia'", config_error=True)
+    assert classify(err).config_error is True
+    assert gateway._codex_oauth_fallback_trigger(_eih_decision(), err) is False
+
+
+def test_mixed_outage_and_config_error_attempts_block_fallback():
+    # Fail closed: a genuine eih 503 outage paired with a LATER non-target
+    # config-error attempt must NOT be laundered into Codex-OAuth fallback. The
+    # first-pass any-config_error guard catches it before target filtering.
+    from types import SimpleNamespace
+
+    from mnemos.domain.pantheon.errors import ErrorClass, NormalizedError, RetryAction
+    from mnemos.domain.pantheon.fallback import AllDeploymentsFailed, AttemptRecord
+
+    eih_outage = NormalizedError(ErrorClass.SERVICE_UNAVAILABLE, 503, True, True, "down", provider="eih")
+    other_cfg = NormalizedError(
+        ErrorClass.SERVICE_UNAVAILABLE, 503, True, True, "no endpoint", provider="deepseek-direct", config_error=True
+    )
+    failure = AllDeploymentsFailed(
+        [
+            AttemptRecord(SimpleNamespace(provider="eih"), eih_outage, RetryAction.FALLOVER, 0),
+            AttemptRecord(SimpleNamespace(provider="deepseek-direct"), other_cfg, RetryAction.RAISE, 0),
+        ],
+        last_exception=None,
+    )
+    assert gateway._codex_oauth_route_failure_trigger(_eih_decision(), failure) is False
+
+
+def test_is_openai_api_keeps_config_faulted_candidate_in_chain(monkeypatch):
+    # A config-faulted candidate is KEPT (True) so it stays in the runtime chain,
+    # fails terminally when attempted, and records its config_error in the attempt
+    # trail (blocking fallback laundering). A healthy openai provider is kept; a
+    # resolved non-openai (Graeae) provider is filtered out.
+    def fake_provider_config(decision):
+        if decision.provider == "broken":
+            raise PantheonGatewayError(503, "provider has no endpoint configured", config_error=True)
+        if decision.provider == "gemini":
+            return {"api": "gemini"}
+        return {"api": "openai", "url": "https://ok.test/v1"}
+
+    monkeypatch.setattr(gateway, "_provider_config", fake_provider_config)
+    assert gateway._is_openai_api(RouteDecision(alias="a", provider="broken", model_id="m", route_type="single", reason="r")) is True
+    assert gateway._is_openai_api(RouteDecision(alias="a", provider="gemini", model_id="m", route_type="single", reason="r")) is False
+    assert gateway._is_openai_api(RouteDecision(alias="a", provider="nvidia", model_id="m", route_type="single", reason="r")) is True
+
+
+def test_config_error_is_non_cooldownable_and_non_retryable():
+    # A config fault must not trip a cooldown (which would pre-filter the bad
+    # deployment out of later requests and hide its config_error from the attempt
+    # trail) nor be retryable.
+    from mnemos.domain.pantheon.http_bridge import classify
+
+    cfg_err = classify(PantheonGatewayError(503, "provider has no endpoint configured", config_error=True))
+    assert cfg_err.config_error is True
+    assert cfg_err.cooldownable is False
+    assert cfg_err.retryable is False
+
+    # A genuine 503 outage is still cooldownable/retryable (unchanged).
+    outage = classify(PantheonGatewayError(503, "upstream down"))
+    assert outage.cooldownable is True
+    assert outage.retryable is True
+
+
 def test_consensus_still_delegates(monkeypatch):
     captured = {}
 
