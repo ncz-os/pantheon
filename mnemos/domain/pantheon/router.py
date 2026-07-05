@@ -58,21 +58,26 @@ def _body_quality_floor(body: dict[str, Any], default: float) -> float:
     pantheon = body.get("pantheon") if isinstance(body.get("pantheon"), dict) else {}
     raw = body.get("quality_floor", pantheon.get("quality_floor", default))
     try:
-        return float(raw)
+        requested = float(raw)
     except (TypeError, ValueError):
         return default
+    return max(default, requested)
 
 
 def _body_max_cost(body: dict[str, Any], default: float | None) -> float | None:
     pantheon = body.get("pantheon") if isinstance(body.get("pantheon"), dict) else {}
-    raw = body.get("max_cost", pantheon.get("max_cost", default))
+    raw = body["max_cost"] if "max_cost" in body else pantheon.get("max_cost", default)
     if raw is None:
-        return None
+        return default
     try:
         value = float(raw)
     except (TypeError, ValueError):
         return default
-    return value if value >= 0 else default
+    if value < 0:
+        return default
+    if default is None:
+        return value
+    return min(value, default)
 
 
 def _passthrough_enabled(settings: Any) -> bool:
