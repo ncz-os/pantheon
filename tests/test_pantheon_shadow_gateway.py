@@ -23,6 +23,22 @@ from mnemos.domain.pantheon.routing_log import routing_payload
 from mnemos.domain.pantheon.runtime import RouterRuntime
 
 
+@pytest.fixture(autouse=True)
+def _standalone_shadow_persistence(monkeypatch):
+    """Keep shadow-app tests isolated from the operator's configured database."""
+    import mnemos.core.lifecycle as lifecycle
+
+    class _Backend:
+        async def close(self):
+            return None
+
+    async def _build(_settings):
+        return "test", _Backend()
+
+    monkeypatch.setattr(lifecycle, "_persistence_backend", None)
+    monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", _build)
+
+
 def _decision(**kw):
     base = dict(alias="a", provider="openai", model_id="gpt-5.3-codex", route_type="single", reason="r")
     base.update(kw)
@@ -924,6 +940,121 @@ def test_responses_stream_tool_call_delta_preserves_arguments():
     tool_delta = payloads[-1]["choices"][0]["delta"]["tool_calls"][0]
     assert tool_delta["id"] == "call_3"
     assert tool_delta["function"]["arguments"] == '{"x":3}'
+
+
+def test_responses_translation_removes_input_before_chat_dispatch(monkeypatch):
+    from fastapi.responses import JSONResponse
+    from mnemos.api.routes import pantheon as pantheon_routes
+
+    seen = {}
+
+    async def _chat(_request, body, _user):
+        seen.update(body)
+        return JSONResponse(
+            {
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-5.5",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {},
+            }
+        )
+
+    monkeypatch.setattr(pantheon_routes, "_chat_completions_impl", _chat)
+    response = asyncio.run(
+        pantheon_routes._responses_impl(
+            SimpleNamespace(),
+            {"model": "gpt-5.5", "input": "hello"},
+            SimpleNamespace(),
+        )
+    )
+
+    assert response.status_code == 200
+    assert seen["messages"] == [{"role": "user", "content": "hello"}]
+    assert "input" not in seen
+
+
+def test_responses_streaming_is_rejected_before_chat_dispatch(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+
+    async def _chat(*_args):
+        raise AssertionError("unsupported stream must not be dispatched as chat SSE")
+
+    monkeypatch.setattr(pantheon_routes, "_chat_completions_impl", _chat)
+    response = asyncio.run(
+        pantheon_routes._responses_impl(
+            SimpleNamespace(),
+            {"model": "gpt-5.5", "input": "hello", "stream": True},
+            SimpleNamespace(),
+        )
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"]["type"] == "invalid_request_error"
+
+
+def test_responses_preserves_chat_error_body(monkeypatch):
+    from fastapi.responses import JSONResponse
+    from mnemos.api.routes import pantheon as pantheon_routes
+
+    error = {"error": {"type": "pantheon_budget_exceeded", "message": "budget exhausted"}}
+
+    async def _chat(_request, _body, _user):
+        return JSONResponse(error, status_code=402)
+
+    monkeypatch.setattr(pantheon_routes, "_chat_completions_impl", _chat)
+    response = asyncio.run(
+        pantheon_routes._responses_impl(
+            SimpleNamespace(),
+            {"model": "gpt-5.5", "input": "hello"},
+            SimpleNamespace(),
+        )
+    )
+
+    assert response.status_code == 402
+    assert json.loads(response.body) == error
+
+
+def test_stream_open_uses_configured_timeout(monkeypatch):
+    seen = {}
+
+    class _Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(status_code=200)
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Client:
+        def stream(self, _method, _url, **kwargs):
+            seen["timeout"] = kwargs["timeout"]
+            return _Manager()
+
+    monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
+    monkeypatch.setattr(gateway, "get_key", lambda _name: "test-key")
+    monkeypatch.setattr(
+        gateway,
+        "_provider_config",
+        lambda _decision: {
+            "api": "openai",
+            "base_url": "https://example.test/v1",
+            "api_key": "test-key",
+            "timeout": 12.5,
+        },
+    )
+
+    opened = asyncio.run(
+        gateway._open_chat_stream_once(
+            _decision(model_id="gpt-5.5"),
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+    asyncio.run(opened.aclose())
+
+    assert isinstance(seen["timeout"], httpx.Timeout)
+    assert seen["timeout"].connect == 12.5
+    assert seen["timeout"].read == 12.5
 
 
 def test_reasoning_budget_default_at_least_8000(monkeypatch):

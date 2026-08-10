@@ -148,6 +148,36 @@ def test_stale_token_refresh_fails_closed_without_distributed_lock(monkeypatch, 
         asyncio.run(_run())
 
 
+def test_codex_stream_open_uses_configured_timeout(monkeypatch, tmp_path):
+    auth_path = tmp_path / "auth.json"
+    _write_json(auth_path, _auth_payload())
+    seen = {}
+
+    class _Manager:
+        async def __aenter__(self):
+            return type("Response", (), {"status_code": 200})()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Client:
+        def stream(self, _method, _url, **kwargs):
+            seen["timeout"] = kwargs["timeout"]
+            return _Manager()
+
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_AUTH_JSON", str(auth_path))
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_TIMEOUT_SECONDS", "17.5")
+    monkeypatch.setattr(codex_oauth, "get_http_client", lambda: _Client())
+
+    opened = asyncio.run(codex_oauth._open_stream(_decision(), {}, "gpt-5.3-codex"))
+    asyncio.run(opened.aclose())
+
+    assert isinstance(seen["timeout"], codex_oauth.httpx.Timeout)
+    assert seen["timeout"].connect == 17.5
+    assert seen["timeout"].read == 17.5
+
+
 def test_model_not_supported_refreshes_catalog_and_retries_reconciled_slug(monkeypatch, tmp_path):
     auth_path = tmp_path / "auth.json"
     models_cache = tmp_path / "models_cache.json"

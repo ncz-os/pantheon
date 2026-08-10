@@ -360,14 +360,14 @@ class TokenManager:
             state = read_auth_state(config)
             if state is None or (not state.access_token and not state.refresh_token):
                 raise CodexOAuthUnavailable("Codex OAuth auth.json absent or empty")
-                if not force_refresh and not _is_stale(state, config):
-                    return state
-                owner = f"{os.getpid()}:{uuid.uuid4().hex}"
-                lock_store = _distributed_lock_store()
-                if lock_store is None and config.require_distributed_refresh_lock:
-                    raise CodexOAuthUnavailable("Codex OAuth distributed refresh lock unavailable")
-                if lock_store is not None and not await _try_acquire_distributed_lock(lock_store, config, owner):
-                    return await self._wait_for_peer_refresh(config, state)
+            if not force_refresh and not _is_stale(state, config):
+                return state
+            owner = f"{os.getpid()}:{uuid.uuid4().hex}"
+            lock_store = _distributed_lock_store()
+            if lock_store is None and config.require_distributed_refresh_lock:
+                raise CodexOAuthUnavailable("Codex OAuth distributed refresh lock unavailable")
+            if lock_store is not None and not await _try_acquire_distributed_lock(lock_store, config, owner):
+                return await self._wait_for_peer_refresh(config, state)
             try:
                 state = read_auth_state(config)
                 if state is None or (not state.access_token and not state.refresh_token):
@@ -716,7 +716,7 @@ async def _open_stream(decision: RouteDecision, body: dict[str, Any], slug: str,
         url,
         json=payload,
         headers=_oauth_headers(state, stream=True),
-        timeout=None,
+        timeout=httpx.Timeout(config.timeout_seconds),
     )
     response = await manager.__aenter__()
     if response.status_code >= 400:

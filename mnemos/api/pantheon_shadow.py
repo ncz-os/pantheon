@@ -72,23 +72,31 @@ async def _shadow_current_user(request: Request) -> UserContext:
 
 @asynccontextmanager
 async def _shadow_lifespan(shadow_app: FastAPI) -> AsyncIterator[None]:
-    """Initialize only the auth surface needed by the shadow routers."""
+    """Initialize persistence and auth needed by the standalone gateway."""
+    import mnemos.core.lifecycle as lifecycle
+
     settings = get_settings()
+    owned_backend = None
+    if lifecycle._persistence_backend is None:
+        _, owned_backend = await lifecycle.build_configured_persistence_backend(settings)
+        lifecycle._persistence_backend = owned_backend
+    shadow_app.state.persistence_backend = lifecycle._persistence_backend
+    shadow_app.state.pool = getattr(lifecycle._persistence_backend, "_pool", None)
     previous_override: Any = _MISSING
-    if settings.pantheon.shadow_no_auth:
-        previous_override = shadow_app.dependency_overrides.get(get_current_user, _MISSING)
-        shadow_app.dependency_overrides[get_current_user] = _shadow_current_user
-    else:
-        configure_auth(None)
     codex_oauth = None
     try:
-        from mnemos.domain.pantheon import codex_oauth as _codex_oauth
+        if settings.pantheon.shadow_no_auth:
+            previous_override = shadow_app.dependency_overrides.get(get_current_user, _MISSING)
+            shadow_app.dependency_overrides[get_current_user] = _shadow_current_user
+        else:
+            configure_auth(None)
+        try:
+            from mnemos.domain.pantheon import codex_oauth as _codex_oauth
 
-        codex_oauth = _codex_oauth
-        codex_oauth.start_background_refresh()
-    except Exception:
-        codex_oauth = None
-    try:
+            codex_oauth = _codex_oauth
+            codex_oauth.start_background_refresh()
+        except Exception:
+            codex_oauth = None
         yield
     finally:
         if codex_oauth is not None:
@@ -98,6 +106,12 @@ async def _shadow_lifespan(shadow_app: FastAPI) -> AsyncIterator[None]:
                 shadow_app.dependency_overrides.pop(get_current_user, None)
             else:
                 shadow_app.dependency_overrides[get_current_user] = previous_override
+        if owned_backend is not None:
+            try:
+                await owned_backend.close()
+            finally:
+                if lifecycle._persistence_backend is owned_backend:
+                    lifecycle._persistence_backend = None
 
 
 app = FastAPI(
@@ -114,6 +128,10 @@ app.include_router(pantheon_router)
 
 @app.get("/health")
 async def health() -> dict[str, object]:
+    import mnemos.core.lifecycle as lifecycle
+
+    if lifecycle._persistence_backend is None:
+        raise HTTPException(status_code=503, detail="persistence backend unavailable")
     settings = get_settings().pantheon
     return {
         "status": "ok",

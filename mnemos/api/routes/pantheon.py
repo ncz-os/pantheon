@@ -769,12 +769,26 @@ async def _responses_impl(
     # OpenAI Responses compatibility for clients that call /v1/responses
     # directly. Internally route through the same policy/cooldown gateway and
     # return an OpenAI-compatible response object.
+    if body.get("stream") is True:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "Streaming is not supported by the PANTHEON Responses endpoint",
+                }
+            },
+        )
+    body = dict(body)
     if "messages" not in body:
         input_value = body.get("input", "")
         content = input_value if isinstance(input_value, str) else str(input_value)
-        body = {**body, "messages": [{"role": "user", "content": content}]}
+        body["messages"] = [{"role": "user", "content": content}]
+    body.pop("input", None)
     result = await _chat_completions_impl(request, body, user)
     if not isinstance(result, JSONResponse):
+        return result
+    if result.status_code >= 400:
         return result
     chat = json.loads(result.body.decode("utf-8"))
     message = _first_chat_message(chat)

@@ -631,7 +631,7 @@ async def _open_chat_stream_once(decision: RouteDecision, body: dict[str, Any]) 
         url,
         json=payload,
         headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
-        timeout=None,
+        timeout=httpx.Timeout(_upstream_timeout(cfg)),
     )
     response = await manager.__aenter__()
     if response.status_code >= 400:
