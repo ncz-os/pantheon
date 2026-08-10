@@ -56,3 +56,22 @@ def test_shadow_health_fails_when_persistence_is_unavailable(monkeypatch):
         asyncio.run(pantheon_shadow.health())
 
     assert exc_info.value.status_code == 503
+
+
+def test_shadow_health_fails_when_shared_state_is_unavailable(monkeypatch):
+    import mnemos.core.lifecycle as lifecycle
+    from mnemos.api import pantheon_shadow
+    from mnemos.domain.pantheon import gateway
+    from mnemos.domain.pantheon.shared_state import SharedStateUnavailable
+
+    async def _unavailable():
+        raise SharedStateUnavailable("shared state unavailable; configure MNEMOS_NATS_URL")
+
+    monkeypatch.setattr(lifecycle, "_persistence_backend", object())
+    monkeypatch.setattr(gateway, "require_shared_state", _unavailable)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(pantheon_shadow.health())
+
+    assert exc_info.value.status_code == 503
+    assert "MNEMOS_NATS_URL" in str(exc_info.value.detail)

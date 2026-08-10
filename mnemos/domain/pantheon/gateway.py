@@ -546,15 +546,21 @@ _RUNTIME: RouterRuntime | None = None
 
 
 def _make_cooldown_store() -> InMemoryCooldownStore:
-    settings = get_settings()
-    if getattr(getattr(settings, "nats", None), "url", None):
-        try:
-            from mnemos.domain.pantheon.cooldown_nats import NatsJetStreamCooldownStore
+    from mnemos.domain.pantheon.shared_state import allow_local_shared_state
 
-            return NatsJetStreamCooldownStore()  # type: ignore[return-value]
-        except Exception:
-            logger.exception("PANTHEON NATS cooldown store unavailable; using in-process fallback")
-    return InMemoryCooldownStore()
+    if allow_local_shared_state():
+        logger.warning(
+            "PANTHEON local shared-state fallback explicitly enabled; use only in development/single-worker mode"
+        )
+        return InMemoryCooldownStore()
+    try:
+        from mnemos.domain.pantheon.cooldown_nats import NatsJetStreamCooldownStore
+
+        return NatsJetStreamCooldownStore()  # type: ignore[return-value]
+    except Exception as exc:
+        from mnemos.domain.pantheon.shared_state import SharedStateUnavailable, unavailable_message
+
+        raise SharedStateUnavailable(unavailable_message("cooldown initialization")) from exc
 
 
 def get_runtime() -> RouterRuntime:
@@ -563,6 +569,22 @@ def get_runtime() -> RouterRuntime:
     if _RUNTIME is None:
         _RUNTIME = RouterRuntime(CooldownManager(_make_cooldown_store()), clock=time.time)
     return _RUNTIME
+
+
+async def require_shared_state() -> None:
+    """Fail routing when the configured authoritative state is unavailable."""
+    from mnemos.domain.pantheon.shared_state import (
+        SharedStateUnavailable,
+        allow_local_shared_state,
+        unavailable_message,
+    )
+
+    store = get_runtime().cooldown._store
+    ready = getattr(store, "aready", None)
+    if ready is not None:
+        await ready()
+    elif not allow_local_shared_state():
+        raise SharedStateUnavailable(unavailable_message("readiness check"))
 
 
 def set_runtime(runtime: RouterRuntime | None) -> None:

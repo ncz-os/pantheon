@@ -129,9 +129,15 @@ app.include_router(pantheon_router)
 @app.get("/health")
 async def health() -> dict[str, object]:
     import mnemos.core.lifecycle as lifecycle
+    from mnemos.domain.pantheon import gateway
+    from mnemos.domain.pantheon.shared_state import SharedStateUnavailable
 
     if lifecycle._persistence_backend is None:
         raise HTTPException(status_code=503, detail="persistence backend unavailable")
+    try:
+        await gateway.require_shared_state()
+    except SharedStateUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     settings = get_settings().pantheon
     return {
         "status": "ok",

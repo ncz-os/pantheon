@@ -39,8 +39,16 @@ all workers use the same bus:
 
 ```env
 MNEMOS_NATS_URL=nats://127.0.0.1:4222
+MNEMOS_PANTHEON_ALLOW_LOCAL_SHARED_STATE=false
 MNEMOS_PANTHEON_GATEWAY_RATE_LIMIT=600/minute
 ```
+
+PANTHEON readiness and generation routes fail with HTTP 503 if the JetStream
+cooldown, counter, lock, or consultation-cap buckets cannot be reached. For a
+single-worker development instance only, set
+`MNEMOS_PANTHEON_ALLOW_LOCAL_SHARED_STATE=true` to use process-local state.
+Never enable that opt-out in a Gunicorn worker pool because each worker would
+receive an independent cooldown and consultation allowance.
 
 Keep `MNEMOS_PANTHEON_GATEWAY_RATE_LIMIT` identical across the pool. For HTTP
 rate-limit counters, use a shared `limits` storage backend instead of
@@ -55,6 +63,12 @@ RATE_LIMIT_TRUST_PROXY=true
 strips/replaces client-supplied forwarding headers.
 
 ## Install / start
+
+Install the production shared-state dependency before starting the worker pool:
+
+```sh
+python -m pip install 'mnemos-pantheon[nats]'
+```
 
 ```sh
 sudo install -d -o mnemos -g mnemos /opt/mnemos

@@ -173,6 +173,7 @@ async def pantheon_v02_client(monkeypatch, db_pool):
     from tests._fake_backend import FakePoolBackedBackend
 
     monkeypatch.setenv("MNEMOS_PANTHEON_ENABLED", "true")
+    monkeypatch.setenv("MNEMOS_PANTHEON_ALLOW_LOCAL_SHARED_STATE", "true")
     monkeypatch.setenv("MNEMOS_PANTHEON_CONSULTATION_CAP", "50")
     monkeypatch.setenv("MNEMOS_PANTHEON_DEFAULT_QUALITY_FLOOR", "0.80")
     monkeypatch.setenv("MNEMOS_PANTHEON_DEFAULT_MAX_COST", "10.0")
@@ -214,6 +215,7 @@ async def pantheon_v02_client(monkeypatch, db_pool):
         app.dependency_overrides.pop(get_current_user, None)
         consultation_cap_bucket.reset()
         monkeypatch.delenv("MNEMOS_PANTHEON_ENABLED", raising=False)
+        monkeypatch.delenv("MNEMOS_PANTHEON_ALLOW_LOCAL_SHARED_STATE", raising=False)
         monkeypatch.delenv("MNEMOS_PANTHEON_CONSULTATION_CAP", raising=False)
         monkeypatch.delenv("MNEMOS_PANTHEON_DEFAULT_QUALITY_FLOOR", raising=False)
         monkeypatch.delenv("MNEMOS_PANTHEON_DEFAULT_MAX_COST", raising=False)

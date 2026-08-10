@@ -24,17 +24,24 @@ from typing import Any
 
 from mnemos.core.config import get_settings
 from mnemos.domain.pantheon.cooldown import CooldownStore, InMemoryCooldownStore
+from mnemos.domain.pantheon.shared_state import (
+    SharedStateUnavailable,
+    allow_local_shared_state,
+    unavailable_message,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "MNEMOS_PANTHEON_COOLDOWN_COUNTERS"
 DEFAULT_COOLDOWN_BUCKET = "MNEMOS_PANTHEON_COOLDOWNS"
 DEFAULT_LOCK_BUCKET = "MNEMOS_PANTHEON_LOCKS"
+DEFAULT_CAP_BUCKET = "MNEMOS_PANTHEON_CONSULTATION_CAPS"
 _PENDING_LIMIT = 1024
 _COUNTER_TTL_SECONDS = 180
 _LOCK_TTL_SECONDS = 120
 _SYNC_TIMEOUT_SECONDS = 0.25
 _CAS_ATTEMPTS = 16
+_CAP_CAS_ATTEMPTS = 256
 _STABLE_FALLBACK_SECRET = b"mnemos-pantheon-nats-kv-key-v1"
 
 
@@ -65,6 +72,10 @@ def _counter_key(tenant: str, deployment: str, minute: int) -> str:
 
 def _lock_key(name: str) -> str:
     return f"lock.{_opaque(name)}"
+
+
+def _cap_key(user_id: str, session_id: str) -> str:
+    return f"cap.{_opaque(user_id)}.{_opaque(session_id)}"
 
 
 def _missing_key(exc: BaseException) -> bool:
@@ -203,7 +214,9 @@ class NatsJetStreamCooldownStore(CooldownStore):
         bucket: str = DEFAULT_BUCKET,
         cooldown_bucket: str = DEFAULT_COOLDOWN_BUCKET,
         lock_bucket: str = DEFAULT_LOCK_BUCKET,
+        cap_bucket: str = DEFAULT_CAP_BUCKET,
         l1: InMemoryCooldownStore | None = None,
+        allow_local_fallback: bool | None = None,
         connect_timeout: float = 1.0,
         sync_timeout: float = _SYNC_TIMEOUT_SECONDS,
         counter_ttl_seconds: int = _COUNTER_TTL_SECONDS,
@@ -212,7 +225,11 @@ class NatsJetStreamCooldownStore(CooldownStore):
         self._bucket_name = bucket
         self._cooldown_bucket_name = cooldown_bucket
         self._lock_bucket_name = lock_bucket
+        self._cap_bucket_name = cap_bucket
         self._l1 = l1 if l1 is not None else InMemoryCooldownStore()
+        self._allow_local_fallback = (
+            allow_local_shared_state() if allow_local_fallback is None else bool(allow_local_fallback)
+        )
         self._loop = _NatsLoopThread()
         self._pending: set[Future] = set()
         self._pending_lock = threading.Lock()
@@ -223,6 +240,10 @@ class NatsJetStreamCooldownStore(CooldownStore):
         self._ready_counter = self._track(self._loop.submit(self._ensure_kv(js, self._bucket_name, counter_ttl_seconds)))
         self._ready_cooldown = self._track(self._loop.submit(self._ensure_kv(js, self._cooldown_bucket_name, 86400)))
         self._ready_lock = self._track(self._loop.submit(self._ensure_kv(js, self._lock_bucket_name, lock_ttl_seconds)))
+        # A consultation cap is per trusted session, not per time window.  A
+        # bucket TTL would silently mint a fresh allowance, so ttl=0 means no
+        # expiry in JetStream.
+        self._ready_cap = self._track(self._loop.submit(self._ensure_kv(js, self._cap_bucket_name, 0)))
 
     async def _ensure_kv(self, js: Any | None, bucket: str, ttl_seconds: int) -> Any | None:
         if js is None:
@@ -260,7 +281,7 @@ class NatsJetStreamCooldownStore(CooldownStore):
         except Exception as exc:
             if not _missing_key(exc):
                 logger.debug("NATS KV lookup for %s failed; attempting create: %s", bucket, exc)
-        bucket_ttl = max(int(ttl_seconds), 1)
+        bucket_ttl = max(int(ttl_seconds), 0)
         try:
             from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
 
@@ -295,6 +316,48 @@ class NatsJetStreamCooldownStore(CooldownStore):
             logger.warning("PANTHEON NATS lock KV unavailable: %s", exc)
             return None
 
+    async def _cap_kv(self) -> Any | None:
+        try:
+            return await asyncio.wrap_future(self._ready_cap)
+        except Exception as exc:
+            logger.warning("PANTHEON NATS consultation cap KV unavailable: %s", exc)
+            return None
+
+    def _unavailable(self, operation: str, exc: BaseException | None = None) -> SharedStateUnavailable:
+        error = SharedStateUnavailable(unavailable_message(operation))
+        if exc is not None:
+            error.__cause__ = exc
+        return error
+
+    async def _probe_kv(self, kv: Any, key: str) -> None:
+        try:
+            await _maybe_await(kv.get(key))
+        except Exception as exc:
+            if not _missing_key(exc):
+                raise
+
+    async def aready(self) -> None:
+        """Validate every authoritative bucket used on PANTHEON request paths."""
+        buckets = await asyncio.gather(
+            self._counter_kv(), self._cooldown_kv(), self._lock_kv(), self._cap_kv()
+        )
+        if any(bucket is None for bucket in buckets):
+            if self._allow_local_fallback:
+                return
+            raise self._unavailable("readiness check")
+        try:
+            probes = [
+                asyncio.wrap_future(
+                    self._track(self._loop.submit(self._probe_kv(bucket, "health.probe")))
+                )
+                for bucket in buckets
+            ]
+            await asyncio.wait_for(asyncio.gather(*probes), timeout=self._sync_timeout)
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("readiness check", exc)
+            logger.warning("PANTHEON NATS readiness probe failed; explicit local fallback is enabled: %s", exc)
+
     def _track(self, fut: Future) -> Future:
         with self._pending_lock:
             if len(self._pending) >= _PENDING_LIMIT:
@@ -321,20 +384,22 @@ class NatsJetStreamCooldownStore(CooldownStore):
                 asyncio.wrap_future(self._track(self._loop.submit(self._load_cooldown(tenant, deployment)))),
                 timeout=self._sync_timeout,
             )
-            if value is not None:
-                return value
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("PANTHEON NATS cooldown async read timed out; using L1")
-        return self._l1.get_cooled_until(tenant, deployment)
+            return value
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("cooldown read", exc)
+            logger.warning("PANTHEON NATS cooldown async read failed; using explicit local fallback: %s", exc)
+            return self._l1.get_cooled_until(tenant, deployment)
 
     def get_cooled_until(self, tenant: str, deployment: str) -> float | None:
         try:
             value = self._run_sync(self._load_cooldown(tenant, deployment))
-            if value is not None:
-                return value
-        except FutureTimeoutError:
-            logger.warning("PANTHEON NATS cooldown read timed out; using L1")
-        return self._l1.get_cooled_until(tenant, deployment)
+            return value
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("cooldown read", exc)
+            logger.warning("PANTHEON NATS cooldown read failed; using explicit local fallback: %s", exc)
+            return self._l1.get_cooled_until(tenant, deployment)
 
     async def aset_cooldown(self, tenant: str, deployment: str, cooled_until: float) -> None:
         self._l1.set_cooldown(tenant, deployment, cooled_until)
@@ -346,16 +411,20 @@ class NatsJetStreamCooldownStore(CooldownStore):
                 timeout=self._sync_timeout,
             )
             self._l1.set_cooldown(tenant, deployment, merged)
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("PANTHEON NATS cooldown async write timed out; using L1")
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("cooldown write", exc)
+            logger.warning("PANTHEON NATS cooldown async write failed; using explicit local fallback: %s", exc)
 
     def set_cooldown(self, tenant: str, deployment: str, cooled_until: float) -> None:
         self._l1.set_cooldown(tenant, deployment, cooled_until)
         try:
             merged = self._run_sync(self._set_cooldown_max(tenant, deployment, cooled_until))
             self._l1.set_cooldown(tenant, deployment, merged)
-        except (FutureTimeoutError, TimeoutError):
-            logger.warning("PANTHEON NATS cooldown write timed out; using L1")
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("cooldown write", exc)
+            logger.warning("PANTHEON NATS cooldown write failed; using explicit local fallback: %s", exc)
 
     async def aincr(self, tenant: str, deployment: str, minute: int, *, success: bool) -> None:
         try:
@@ -366,16 +435,20 @@ class NatsJetStreamCooldownStore(CooldownStore):
                 timeout=self._sync_timeout,
             )
             self._set_l1_counts(tenant, deployment, minute, *counts)
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("PANTHEON NATS counter async increment timed out; using L1")
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("cooldown counter increment", exc)
+            logger.warning("PANTHEON NATS counter async increment failed; using explicit local fallback: %s", exc)
             self._l1.incr(tenant, deployment, minute, success=success)
 
     def incr(self, tenant: str, deployment: str, minute: int, *, success: bool) -> None:
         try:
             counts = self._run_sync(self._increment_counter(tenant, deployment, minute, success=success))
             self._set_l1_counts(tenant, deployment, minute, *counts)
-        except FutureTimeoutError:
-            logger.warning("PANTHEON NATS counter increment timed out; using L1")
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("cooldown counter increment", exc)
+            logger.warning("PANTHEON NATS counter increment failed; using explicit local fallback: %s", exc)
             self._l1.incr(tenant, deployment, minute, success=success)
 
     async def aget_counts(self, tenant: str, deployment: str, minute: int) -> tuple[int, int]:
@@ -386,18 +459,37 @@ class NatsJetStreamCooldownStore(CooldownStore):
             )
             if loaded is not None:
                 return loaded
-        except (TimeoutError, asyncio.TimeoutError):
-            logger.warning("PANTHEON NATS counter async read timed out; using L1")
-        return self._l1.get_counts(tenant, deployment, minute)
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("cooldown counter read", exc)
+            logger.warning("PANTHEON NATS counter async read failed; using explicit local fallback: %s", exc)
+            return self._l1.get_counts(tenant, deployment, minute)
 
     def get_counts(self, tenant: str, deployment: str, minute: int) -> tuple[int, int]:
         try:
             loaded = self._run_sync(self._load_counter(tenant, deployment, minute))
             if loaded is not None:
                 return loaded
-        except FutureTimeoutError:
-            logger.warning("PANTHEON NATS counter read timed out; using L1")
-        return self._l1.get_counts(tenant, deployment, minute)
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("cooldown counter read", exc)
+            logger.warning("PANTHEON NATS counter read failed; using explicit local fallback: %s", exc)
+            return self._l1.get_counts(tenant, deployment, minute)
+
+    async def acheck_and_increment_consultation_cap(
+        self, *, user_id: str, session_id: str, cap: int
+    ) -> tuple[bool, int]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(
+                    self._track(self._loop.submit(self._increment_consultation_cap(user_id, session_id, cap)))
+                ),
+                timeout=self._sync_timeout,
+            )
+        except Exception as exc:
+            if not self._allow_local_fallback:
+                raise self._unavailable("consultation cap increment", exc)
+            raise self._unavailable("consultation cap local fallback delegation", exc)
 
     def _set_l1_counts(self, tenant: str, deployment: str, minute: int, successes: int, failures: int) -> None:
         key = (tenant, deployment, minute)
@@ -473,7 +565,7 @@ class NatsJetStreamCooldownStore(CooldownStore):
     async def _load_cooldown(self, tenant: str, deployment: str) -> float | None:
         kv = await self._cooldown_kv()
         if kv is None:
-            return None
+            raise self._unavailable("cooldown read")
         try:
             payload = _loads(await _maybe_await(kv.get(_cooldown_key(tenant, deployment))))
         except Exception as exc:
@@ -487,7 +579,7 @@ class NatsJetStreamCooldownStore(CooldownStore):
     async def _set_cooldown_max(self, tenant: str, deployment: str, cooled_until: float) -> float:
         kv = await self._cooldown_kv()
         if kv is None:
-            return cooled_until
+            raise self._unavailable("cooldown write")
         key = _cooldown_key(tenant, deployment)
         for _attempt in range(_CAS_ATTEMPTS):
             try:
@@ -519,7 +611,7 @@ class NatsJetStreamCooldownStore(CooldownStore):
     async def _load_counter(self, tenant: str, deployment: str, minute: int) -> tuple[int, int] | None:
         kv = await self._counter_kv()
         if kv is None:
-            return None
+            raise self._unavailable("cooldown counter read")
         try:
             payload = _loads(await _maybe_await(kv.get(_counter_key(tenant, deployment, minute))))
         except Exception as exc:
@@ -534,8 +626,7 @@ class NatsJetStreamCooldownStore(CooldownStore):
     async def _increment_counter(self, tenant: str, deployment: str, minute: int, *, success: bool) -> tuple[int, int]:
         kv = await self._counter_kv()
         if kv is None:
-            self._l1.incr(tenant, deployment, minute, success=success)
-            return self._l1.get_counts(tenant, deployment, minute)
+            raise self._unavailable("cooldown counter increment")
         key = _counter_key(tenant, deployment, minute)
         field = "successes" if success else "failures"
         for _attempt in range(_CAS_ATTEMPTS):
@@ -563,6 +654,41 @@ class NatsJetStreamCooldownStore(CooldownStore):
                 if not _wrong_revision(exc):
                     raise
         raise RuntimeError(f"NATS KV counter CAS failed for {key}")
+
+    async def _increment_consultation_cap(self, user_id: str, session_id: str, cap: int) -> tuple[bool, int]:
+        kv = await self._cap_kv()
+        if kv is None:
+            raise self._unavailable("consultation cap increment")
+        key = _cap_key(user_id, session_id)
+        limit = max(int(cap), 0)
+        for _attempt in range(_CAP_CAS_ATTEMPTS):
+            try:
+                entry = await _maybe_await(kv.get(key))
+                payload = _loads(entry)
+                revision = _entry_revision(entry)
+                used = int(payload.get("used", 0))
+            except Exception as exc:
+                if not _missing_key(exc):
+                    raise
+                revision = None
+                used = 0
+            if used >= limit:
+                return False, used
+            updated = used + 1
+            value = _dumps({"used": updated})
+            try:
+                if revision is None:
+                    try:
+                        await _kv_create(kv, key, value)
+                    except AttributeError:
+                        await _kv_put(kv, key, value)
+                else:
+                    await _kv_update(kv, key, value, revision)
+                return True, updated
+            except Exception as exc:
+                if not _wrong_revision(exc):
+                    raise
+        raise RuntimeError(f"NATS KV consultation cap CAS failed for {key}")
 
     async def _try_acquire_lock(
         self,

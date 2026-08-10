@@ -20,6 +20,7 @@ from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.core.rate_limit import limiter
 from mnemos.persistence.base import UsageLedgerRecord
+from mnemos.domain.pantheon.shared_state import SharedStateUnavailable
 
 router = APIRouter(prefix="/pantheon/v1", tags=["pantheon"])
 openai_router = APIRouter(prefix="/v1", tags=["pantheon-openai-shadow"])
@@ -223,7 +224,7 @@ def _consultation_cap_exceeded(result: Any) -> JSONResponse:
     )
 
 
-def _check_consultation_cap(
+async def _check_consultation_cap(
     consultation_cap_bucket: Any,
     decision: Any,
     *,
@@ -234,11 +235,10 @@ def _check_consultation_cap(
     if model.get("usage_tier") != "consultation_only":
         return None
     cap = get_settings().pantheon.consultation_cap
-    return consultation_cap_bucket.check_and_increment(
-        user_id=user_id,
-        session_id=session_id,
-        cap=cap,
-    )
+    async_check = getattr(consultation_cap_bucket, "acheck_and_increment", None)
+    if async_check is not None:
+        return await async_check(user_id=user_id, session_id=session_id, cap=cap)
+    return consultation_cap_bucket.check_and_increment(user_id=user_id, session_id=session_id, cap=cap)
 
 
 def _audit_payload_for_response(
@@ -594,8 +594,11 @@ async def _chat_completions_impl(
     request_id = _request_id(request)
     identity = _upstream_identity(gateway, request, user, session_id=session_id, request_id=request_id)
     try:
+        require_shared_state = getattr(gateway, "require_shared_state", None)
+        if require_shared_state is not None:
+            await require_shared_state()
         decision = await pantheon_router.route_model(model, body)
-        cap_result = _check_consultation_cap(
+        cap_result = await _check_consultation_cap(
             consultation_cap_bucket,
             decision,
             user_id=user.user_id,
@@ -732,6 +735,8 @@ async def _chat_completions_impl(
         return JSONResponse(response_data)
     except PantheonRoutingError as exc:
         raise _to_http_exception(exc) from exc
+    except SharedStateUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except gateway.PantheonGatewayError as exc:
         if decision is not None:
             await _log_route_outcome_best_effort(
