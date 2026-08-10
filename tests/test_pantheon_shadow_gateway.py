@@ -252,7 +252,7 @@ def test_shadow_app_serves_models_without_auth_startup(monkeypatch):
         m.setattr(catalog, "models_response", _models_response)
         _reset_settings_for_tests()
 
-        with TestClient(app) as client:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
             response = client.get("/pantheon/v1/models")
 
     _reset_settings_for_tests()
@@ -317,7 +317,7 @@ def test_shadow_app_serves_openai_chat_without_auth_startup(monkeypatch):
         )
         _reset_settings_for_tests()
 
-        with TestClient(app) as client:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
             response = client.post(
                 "/v1/chat/completions",
                 json={"model": "shadow-model", "messages": [{"role": "user", "content": "hi"}]},
@@ -392,7 +392,7 @@ def test_shadow_app_openai_responses_dispatches_codex_model(monkeypatch):
         )
         _reset_settings_for_tests()
 
-        with TestClient(app) as client:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
             response = client.post(
                 "/v1/responses",
                 json={"model": "gpt-5.3-codex", "input": "Return the word ok."},
@@ -464,7 +464,7 @@ def test_shadow_app_responses_handles_empty_choices_and_missing_usage(monkeypatc
         )
         _reset_settings_for_tests()
 
-        with TestClient(app) as client:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
             response = client.post(
                 "/v1/responses",
                 json={"model": "gpt-5.5", "input": "Return nothing."},
@@ -671,7 +671,7 @@ def test_shadow_app_chat_passthrough_null_content_response_preserved_and_audited
         )
         _reset_settings_for_tests()
 
-        with TestClient(app) as client:
+        with TestClient(app, client=("127.0.0.1", 50000)) as client:
             response = client.post(
                 "/v1/chat/completions",
                 json={"model": "gemini-3.1-pro", "messages": [{"role": "user", "content": "hi"}]},
@@ -1630,6 +1630,9 @@ def test_streaming_telemetry_logs_after_stream_with_real_wire_model(monkeypatch)
         )
         yield b"data: [DONE]\n\n"
 
+    async def _preflight(_decision):
+        return None
+
     def _routing_payload(**kwargs):
         logs.append(kwargs)
         resolved = kwargs.get("resolved_wire_model")
@@ -1639,6 +1642,7 @@ def test_streaming_telemetry_logs_after_stream_with_real_wire_model(monkeypatch)
         scheduled.append((payload, metadata))
 
     monkeypatch.setattr(gateway, "stream_chat_completion", _stream)
+    monkeypatch.setattr(gateway, "preflight_chat_endpoint", _preflight)
     monkeypatch.setattr(
         pantheon_routes,
         "_pantheon_imports",

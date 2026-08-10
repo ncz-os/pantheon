@@ -242,7 +242,7 @@ async def test_agentic_cap_blocks_fifty_first_same_session(pantheon_v02_client):
 
 
 @pytest.mark.asyncio
-async def test_agentic_cap_is_independent_by_session(pantheon_v02_client):
+async def test_agentic_cap_cannot_be_reset_by_client_session_header(pantheon_v02_client):
     client, _db_pool = pantheon_v02_client
     body = {"model": "claude-consult", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -259,14 +259,14 @@ async def test_agentic_cap_is_independent_by_session(pantheon_v02_client):
         json=body,
         headers={"X-Pantheon-Session": "session-a"},
     )
-    other_session = await client.post(
+    rotated_client_label = await client.post(
         "/pantheon/v1/chat/completions",
         json=body,
         headers={"X-Pantheon-Session": "session-b"},
     )
 
     assert blocked.status_code == 429
-    assert other_session.status_code == 200
+    assert rotated_client_label.status_code == 429
 
 
 @pytest.mark.asyncio

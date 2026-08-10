@@ -32,6 +32,7 @@ include = [
     "mnemos.api.routes",
     "mnemos.domain.pantheon",
     "mnemos.domain.pantheon.*",
+    "mnemos.workers",
 ]
 namespaces = true
 

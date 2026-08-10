@@ -70,7 +70,7 @@ class _FakeEngine:
 
 
 @pytest.fixture
-def pantheon_client(monkeypatch):
+def pantheon_client(monkeypatch, tmp_path):
     from mnemos.api.main import app
     from mnemos.core.config import _reset_settings_for_tests
     import mnemos.core.lifecycle as lc
@@ -80,11 +80,16 @@ def pantheon_client(monkeypatch):
     monkeypatch.setenv("MNEMOS_PANTHEON_ENABLED", "true")
     monkeypatch.setenv("MNEMOS_PANTHEON_DEFAULT_QUALITY_FLOOR", "0.90")
     monkeypatch.setenv("MNEMOS_PANTHEON_DEFAULT_MAX_COST", "10.0")
+    monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "pantheon.sqlite"))
     _reset_settings_for_tests()
     monkeypatch.setattr(lc, "_pool", None)
 
     fake_engine = _FakeEngine()
     monkeypatch.setattr(pantheon_catalog, "get_graeae_engine", lambda: fake_engine)
+    # This fixture exercises only the mocked GRAEAE registry. The production
+    # catalog also carries fleet models, which have their own focused tests.
+    monkeypatch.setattr(pantheon_catalog, "_PANTHEON_FLEET_MODELS", ())
+    monkeypatch.setattr(pantheon_catalog, "_FLEET_MODELS_BY_ID", {})
     monkeypatch.setattr(pantheon_gateway, "get_graeae_engine", lambda: fake_engine)
     monkeypatch.setattr(pantheon_gateway, "get_key", lambda _provider: "test-key")
 
@@ -100,11 +105,12 @@ def pantheon_client(monkeypatch):
         _reset_settings_for_tests()
 
 
-def test_models_disabled_returns_503(monkeypatch):
+def test_models_disabled_returns_503(monkeypatch, tmp_path):
     from mnemos.api.main import app
     from mnemos.core.config import _reset_settings_for_tests
 
     monkeypatch.setenv("MNEMOS_PANTHEON_ENABLED", "false")
+    monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "pantheon-disabled.sqlite"))
     _reset_settings_for_tests()
     app.dependency_overrides[get_current_user] = lambda: _user()
     try:
