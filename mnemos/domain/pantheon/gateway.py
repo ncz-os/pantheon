@@ -550,7 +550,7 @@ def _make_cooldown_store() -> InMemoryCooldownStore:
 
     if allow_local_shared_state():
         logger.warning(
-            "PANTHEON local shared-state fallback explicitly enabled; use only in development/single-worker mode"
+            "PANTHEON using process-local shared state; use only in a single-worker deployment"
         )
         return InMemoryCooldownStore()
     try:

@@ -110,7 +110,12 @@ async def consumer_loop(
             )
             delay = 1.0
             while True:
-                msg = await subscription.next_msg(timeout=1)
+                try:
+                    msg = await subscription.next_msg(timeout=1)
+                except TimeoutError:
+                    # nats-py uses nats.errors.TimeoutError (a built-in
+                    # TimeoutError subclass) for an ordinary idle pull.
+                    continue
                 try:
                     await handle_message(backend, msg)
                 except PoisonMessageError as exc:

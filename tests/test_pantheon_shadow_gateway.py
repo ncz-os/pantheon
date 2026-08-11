@@ -1771,6 +1771,7 @@ def test_unknown_explicit_model_routes_through_budget_cooldown_and_audit(monkeyp
 
     assert response.status_code == 200
     assert budget_calls and budget_calls[0]["caller_subsystem"] == "pantheon"
+    assert budget_calls[0]["provider"] == "nvidia"
     assert posted[0][0] == "https://passthrough.test/v1/chat/completions"
     assert posted[0][1]["model"] == explicit_model
     assert posted[0][1]["messages"] == [{"role": "user", "content": "hi"}]

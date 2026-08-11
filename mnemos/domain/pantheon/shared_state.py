@@ -12,8 +12,32 @@ class SharedStateUnavailable(RuntimeError):
 
 
 def allow_local_shared_state() -> bool:
-    """Return whether the explicit development/single-worker opt-out is set."""
-    return os.getenv(LOCAL_SHARED_STATE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    """Return whether process-local state is safe for this deployment.
+
+    An explicit opt-out remains available for development.  Otherwise the
+    documented no-NATS, single-worker configuration uses local state, while a
+    configured NATS service or an explicitly multi-worker process fails closed.
+    ``WEB_CONCURRENCY`` is included because the standalone PANTHEON launcher
+    uses it rather than ``MNEMOS_WORKERS``.
+    """
+    if os.getenv(LOCAL_SHARED_STATE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+
+    from mnemos.core.config import get_settings
+
+    settings = get_settings()
+    if str(settings.nats.url or "").strip():
+        return False
+    worker_count = int(settings.server.workers)
+    web_concurrency = os.getenv("WEB_CONCURRENCY", "").strip()
+    if web_concurrency:
+        try:
+            worker_count = max(worker_count, int(web_concurrency))
+        except ValueError:
+            # An invalid launcher value must not silently weaken shared-state
+            # enforcement; gunicorn will reject it independently at startup.
+            return False
+    return worker_count == 1
 
 
 def unavailable_message(operation: str) -> str:

@@ -408,6 +408,63 @@ async def test_lifecycle_schedules_pantheon_audit_consumer_for_non_pg_backend(mo
 
 
 @pytest.mark.asyncio
+async def test_audit_consumer_idle_timeout_keeps_healthy_subscription() -> None:
+    from mnemos.workers.pantheon_routing_audit_consumer import consumer_loop
+
+    idle_polled = asyncio.Event()
+
+    class _Subscription:
+        unsubscribed = 0
+
+        async def next_msg(self, *, timeout):
+            assert timeout == 1
+            await asyncio.sleep(0)
+            idle_polled.set()
+            raise TimeoutError
+
+        async def unsubscribe(self):
+            self.unsubscribed += 1
+
+    class _JetStream:
+        def __init__(self, subscription):
+            self.subscription = subscription
+
+        async def subscribe(self, *_args, **_kwargs):
+            return self.subscription
+
+    class _Client:
+        drained = 0
+
+        async def drain(self):
+            self.drained += 1
+
+    subscription = _Subscription()
+    client = _Client()
+    connects = 0
+
+    async def connect(_settings):
+        nonlocal connects
+        connects += 1
+        return client, _JetStream(subscription)
+
+    settings = SimpleNamespace(
+        nats=SimpleNamespace(audit_consumer_enabled=True, url="nats://test")
+    )
+    task = asyncio.create_task(consumer_loop(object(), settings=settings, connect=connect))
+    await idle_polled.wait()
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert connects == 1
+    assert subscription.unsubscribed == 0
+    assert client.drained == 0
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_pantheon_budget_denies_when_knemon_over_cap(monkeypatch, pantheon_v02_client):
     from mnemos.core.config import _reset_settings_for_tests
 

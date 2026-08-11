@@ -126,10 +126,13 @@ def test_shared_cap_keys_do_not_expose_principals() -> None:
         assert plaintext not in key
 
 
-def test_local_cap_requires_explicit_single_worker_setting(monkeypatch) -> None:
+def test_local_cap_fails_closed_for_multi_worker_without_nats(monkeypatch) -> None:
     from mnemos.domain.pantheon import gateway
+    from mnemos.core.config import _reset_settings_for_tests
 
     monkeypatch.delenv("MNEMOS_PANTHEON_ALLOW_LOCAL_SHARED_STATE", raising=False)
+    monkeypatch.setenv("MNEMOS_WORKERS", "2")
+    _reset_settings_for_tests()
     gateway.set_runtime(
         RouterRuntime(CooldownManager(InMemoryCooldownStore()), clock=lambda: 0.0)
     )
@@ -139,6 +142,56 @@ def test_local_cap_requires_explicit_single_worker_setting(monkeypatch) -> None:
             asyncio.run(bucket.acheck_and_increment(user_id="alice", session_id="s", cap=1))
     finally:
         gateway.set_runtime(None)
+        _reset_settings_for_tests()
+
+
+@pytest.mark.parametrize("profile", ["server", "edge", "dev", "personal"])
+def test_default_single_worker_profiles_allow_local_state_without_nats(monkeypatch, profile) -> None:
+    from mnemos.core.config import _reset_settings_for_tests
+    from mnemos.domain.pantheon import gateway
+
+    monkeypatch.delenv("MNEMOS_PANTHEON_ALLOW_LOCAL_SHARED_STATE", raising=False)
+    monkeypatch.delenv("MNEMOS_NATS_URL", raising=False)
+    monkeypatch.delenv("MNEMOS_WORKERS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.setenv("MNEMOS_PROFILE", profile)
+    _reset_settings_for_tests()
+    gateway.set_runtime(None)
+    try:
+        assert isinstance(gateway.get_runtime().cooldown._store, InMemoryCooldownStore)
+        asyncio.run(gateway.require_shared_state())
+    finally:
+        gateway.set_runtime(None)
+        _reset_settings_for_tests()
+
+
+@pytest.mark.parametrize("worker_env", [("MNEMOS_WORKERS", "2"), ("WEB_CONCURRENCY", "4")])
+def test_explicit_multi_worker_without_nats_does_not_allow_local_state(monkeypatch, worker_env) -> None:
+    from mnemos.core.config import _reset_settings_for_tests
+    from mnemos.domain.pantheon.shared_state import allow_local_shared_state
+
+    monkeypatch.delenv("MNEMOS_PANTHEON_ALLOW_LOCAL_SHARED_STATE", raising=False)
+    monkeypatch.delenv("MNEMOS_NATS_URL", raising=False)
+    monkeypatch.setenv(*worker_env)
+    _reset_settings_for_tests()
+    try:
+        assert allow_local_shared_state() is False
+    finally:
+        _reset_settings_for_tests()
+
+
+def test_configured_nats_remains_authoritative_for_single_worker(monkeypatch) -> None:
+    from mnemos.core.config import _reset_settings_for_tests
+    from mnemos.domain.pantheon.shared_state import allow_local_shared_state
+
+    monkeypatch.delenv("MNEMOS_PANTHEON_ALLOW_LOCAL_SHARED_STATE", raising=False)
+    monkeypatch.setenv("MNEMOS_NATS_URL", "nats://127.0.0.1:4222")
+    monkeypatch.setenv("MNEMOS_WORKERS", "1")
+    _reset_settings_for_tests()
+    try:
+        assert allow_local_shared_state() is False
+    finally:
+        _reset_settings_for_tests()
 
 
 def test_local_cap_opt_out_preserves_single_worker_behavior(monkeypatch) -> None:

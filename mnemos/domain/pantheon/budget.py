@@ -18,6 +18,7 @@ async def evaluate_budget(
     estimated_cost_usd: float = 0.0,
     limit_usd: float | None = None,
     caller_subsystem: str = "pantheon",
+    provider: str | None = None,
 ) -> BudgetDecision:
     """Delegate PANTHEON affordability checks to KNEMON's usage ledger."""
     return await evaluate_usage_budget(
@@ -25,6 +26,7 @@ async def evaluate_budget(
         estimated_cost_usd=estimated_cost_usd,
         limit_usd=limit_usd,
         caller_subsystem=caller_subsystem,
+        provider=provider,
     )
 
 

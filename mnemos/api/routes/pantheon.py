@@ -348,6 +348,7 @@ async def _check_budget_or_deny(
         backend=lc._persistence_backend,
         estimated_cost_usd=estimated_cost_usd,
         caller_subsystem="pantheon",
+        provider=decision.provider,
     )
     return (None if budget_decision.allowed else _budget_denied_response(budget_decision), estimated_cost_usd, client_hint_usd)
 

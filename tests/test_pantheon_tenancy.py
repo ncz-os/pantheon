@@ -77,6 +77,33 @@ async def test_budget_unlimited(monkeypatch, budget_rows):
         _reset_settings_for_tests()
 
 
+@pytest.mark.asyncio
+async def test_budget_forwards_provider_to_knemon(monkeypatch):
+    calls = []
+
+    async def fake_evaluate(backend, **kwargs):
+        calls.append((backend, kwargs))
+        return object()
+
+    monkeypatch.setattr("mnemos.domain.pantheon.budget.evaluate_usage_budget", fake_evaluate)
+    backend = object()
+
+    result = await evaluate_budget(backend=backend, provider="openai")
+
+    assert result is not None
+    assert calls == [
+        (
+            backend,
+            {
+                "estimated_cost_usd": 0.0,
+                "limit_usd": None,
+                "caller_subsystem": "pantheon",
+                "provider": "openai",
+            },
+        )
+    ]
+
+
 # ── keyvault ──
 def test_env_resolver_tenant_agnostic():
     r = EnvKeyResolver(env={"OPENAI_API_KEY": "sk-shared"})
