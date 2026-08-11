@@ -281,9 +281,42 @@ def test_nats_bucket_created_with_ttl_and_no_per_key_ttl():
         store.flush()
         ttls = [cfg.get("ttl") if isinstance(cfg, dict) else getattr(cfg, "ttl", None) for cfg in js.configs]
         assert 7 in ttls
+        assert 3600 in ttls
         assert 86400 in ttls
         store.incr("tenant", "dep", 17, success=False)
         assert store.refresh_counts("tenant", "dep", 17) == (0, 1)
+    finally:
+        store.close()
+
+
+def test_nats_existing_consultation_bucket_ttl_is_reconciled():
+    from types import SimpleNamespace
+
+    from mnemos.domain.pantheon.cooldown_nats import (
+        DEFAULT_CAP_BUCKET,
+        NatsJetStreamCooldownStore,
+    )
+
+    class FakeJs:
+        def __init__(self):
+            self.kv = _FakeNatsKv()
+            self.updated = []
+
+        async def key_value(self, _bucket):
+            return self.kv
+
+        async def stream_info(self, name):
+            max_age = 0 if name == f"KV_{DEFAULT_CAP_BUCKET}" else 3600
+            return SimpleNamespace(config=SimpleNamespace(name=name, max_age=max_age))
+
+        async def update_stream(self, *, config):
+            self.updated.append((config.name, config.max_age))
+
+    js = FakeJs()
+    store = NatsJetStreamCooldownStore(js=js)
+    try:
+        store.flush()
+        assert (f"KV_{DEFAULT_CAP_BUCKET}", 3600.0) in js.updated
     finally:
         store.close()
 

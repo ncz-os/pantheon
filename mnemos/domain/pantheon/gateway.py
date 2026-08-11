@@ -437,7 +437,39 @@ def _responses_input_from_messages(messages: list[dict[str, Any]]) -> list[dict[
                 }
             )
         else:
-            out.append(item)
+            tool_calls = item.pop("tool_calls", None)
+            content = item.get("content")
+            if isinstance(content, list):
+                converted_content: list[Any] = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        converted_content.append(part)
+                        continue
+                    converted_part = dict(part)
+                    if converted_part.get("type") == "text":
+                        converted_part["type"] = "input_text"
+                    elif converted_part.get("type") == "image_url":
+                        converted_part["type"] = "input_image"
+                        image_url = converted_part.get("image_url")
+                        if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                            converted_part["image_url"] = image_url["url"]
+                    converted_content.append(converted_part)
+                item["content"] = converted_content
+            if item.get("content") is not None or not tool_calls:
+                out.append(item)
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    function = call.get("function") if isinstance(call, dict) else None
+                    if not isinstance(function, dict):
+                        continue
+                    out.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call.get("id"),
+                            "name": function.get("name"),
+                            "arguments": function.get("arguments"),
+                        }
+                    )
     return out
 
 

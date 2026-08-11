@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from mnemos.api import dependencies
@@ -973,6 +974,151 @@ def test_responses_translation_removes_input_before_chat_dispatch(monkeypatch):
     assert response.status_code == 200
     assert seen["messages"] == [{"role": "user", "content": "hello"}]
     assert "input" not in seen
+
+
+def test_responses_translation_preserves_structured_messages_and_tool_outputs(monkeypatch):
+    from fastapi.responses import JSONResponse
+    from mnemos.api.routes import pantheon as pantheon_routes
+
+    seen = {}
+
+    async def _chat(_request, body, _user):
+        seen.update(body)
+        return JSONResponse(
+            {
+                "id": "chatcmpl-structured",
+                "created": 1,
+                "model": "gpt-5.5",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {},
+            }
+        )
+
+    monkeypatch.setattr(pantheon_routes, "_chat_completions_impl", _chat)
+    response = asyncio.run(
+        pantheon_routes._responses_impl(
+            SimpleNamespace(),
+            {
+                "model": "gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": '{"q":"x"}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "result",
+                    },
+                ],
+            },
+            SimpleNamespace(),
+        )
+    )
+
+    assert response.status_code == 200
+    assert seen["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+    assert "input" not in seen
+
+
+def test_responses_translation_rejects_unsupported_structured_input(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+
+    async def _chat(*_args):
+        raise AssertionError("invalid input must not be dispatched")
+
+    monkeypatch.setattr(pantheon_routes, "_chat_completions_impl", _chat)
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            pantheon_routes._responses_impl(
+                SimpleNamespace(),
+                {"model": "gpt-5.5", "input": [{"type": "computer_screenshot"}]},
+                SimpleNamespace(),
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+
+
+def test_responses_provider_translation_restores_responses_content_types():
+    from mnemos.domain.pantheon.gateway import _responses_input_from_messages
+
+    assert _responses_input_from_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+    ) == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "hi"},
+                {"type": "input_image", "image_url": "https://example.test/a.png"},
+            ],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "lookup",
+            "arguments": '{"q":"x"}',
+        },
+        {"type": "function_call_output", "call_id": "call_1", "output": "result"},
+    ]
+
+
+def test_consultation_cap_window_is_server_derived_and_rotates_hourly(monkeypatch):
+    from mnemos.api.routes import pantheon as pantheon_routes
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(mnemos_session_id="server-session"),
+        headers={"x-pantheon-session": "client-session"},
+    )
+    user = SimpleNamespace(user_id="alice", session_id="cookie-session")
+
+    monkeypatch.setattr(pantheon_routes.time, "time", lambda: 7199.9)
+    first = pantheon_routes._trusted_session_id(request, user)
+    request.headers["x-pantheon-session"] = "rotated-client-session"
+    assert pantheon_routes._trusted_session_id(request, user) == first == "hour:1"
+
+    monkeypatch.setattr(pantheon_routes.time, "time", lambda: 7200.0)
+    assert pantheon_routes._trusted_session_id(request, user) == "hour:2"
 
 
 def test_responses_streaming_is_rejected_before_chat_dispatch(monkeypatch):

@@ -156,17 +156,83 @@ def _pantheon_session_id(request: Request, user: UserContext) -> str:
 
 
 def _trusted_session_id(request: Request, user: UserContext) -> str:
-    # SECURITY (review #6): server-derived session id for the consultation cap.
-    # Uses only values the server controls — the authenticated context's
-    # session_id or a session the server stamped on request.state — and otherwise
-    # falls back to the authenticated user_id, so the per-session cap cannot be
-    # evaded by rotating a client-supplied session header/param.
-    return str(
-        getattr(user, "session_id", None)
-        or getattr(request.state, "mnemos_session_id", None)
-        or user.user_id
-        or "default"
-    )
+    # SECURITY: consultation allowances use a server-derived hourly window for
+    # every auth mode. This keeps client labels from resetting the cap while
+    # ensuring API-key and personal-mode callers, which have no trusted session
+    # identifier, are not permanently locked out.
+    del request, user
+    return f"hour:{int(time.time() // 3600)}"
+
+
+def _responses_input_error(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail=message)
+
+
+def _responses_content_to_chat(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise _responses_input_error("Responses message content must be a string or array")
+    converted: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            raise _responses_input_error("Responses message content items must be objects")
+        item_type = part.get("type")
+        if item_type in {"input_text", "output_text", "text"} and isinstance(part.get("text"), str):
+            converted.append({"type": "text", "text": part["text"]})
+        elif item_type in {"input_image", "image_url"} and isinstance(part.get("image_url"), (str, dict)):
+            image_url = part["image_url"]
+            if isinstance(image_url, str):
+                image_url = {"url": image_url}
+            converted.append({"type": "image_url", "image_url": image_url})
+        else:
+            raise _responses_input_error(f"Unsupported Responses content item type: {item_type!r}")
+    return converted
+
+
+def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}]
+    if not isinstance(input_value, list) or not input_value:
+        raise _responses_input_error("Responses input must be a non-empty string or array")
+    messages: list[dict[str, Any]] = []
+    for item in input_value:
+        if not isinstance(item, dict):
+            raise _responses_input_error("Responses input items must be objects")
+        item_type = item.get("type", "message" if "role" in item else None)
+        if item_type == "message":
+            role = item.get("role")
+            if role not in {"developer", "system", "user", "assistant"}:
+                raise _responses_input_error(f"Unsupported Responses message role: {role!r}")
+            messages.append({"role": role, "content": _responses_content_to_chat(item.get("content"))})
+        elif item_type == "function_call":
+            call_id = item.get("call_id") or item.get("id")
+            name = item.get("name")
+            arguments = item.get("arguments")
+            if not all(isinstance(value, str) and value for value in (call_id, name, arguments)):
+                raise _responses_input_error("Responses function_call requires call_id, name, and arguments")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    ],
+                }
+            )
+        elif item_type == "function_call_output":
+            call_id = item.get("call_id")
+            output = item.get("output")
+            if not isinstance(call_id, str) or not call_id or not isinstance(output, str):
+                raise _responses_input_error("Responses function_call_output requires call_id and string output")
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+        else:
+            raise _responses_input_error(f"Unsupported Responses input item type: {item_type!r}")
+    return messages
 
 
 def _request_id(request: Request) -> str:
@@ -205,20 +271,21 @@ def _upstream_identity(
 
 
 def _consultation_cap_exceeded(result: Any) -> JSONResponse:
+    retry_after = max(1, int(3600 - (time.time() % 3600)))
     return JSONResponse(
         status_code=429,
-        headers={"Retry-After": "0"},
+        headers={"Retry-After": str(retry_after)},
         content={
             "error": {
                 "type": "pantheon_usage_tier_cap_exceeded",
                 "message": (
-                    "usage_tier=consultation_only is capped per user session; "
-                    "start a new session or choose an agentic_ok model for agent workflows"
+                    "usage_tier=consultation_only is capped per user per hourly window; "
+                    "retry after the window resets or choose an agentic_ok model for agent workflows"
                 ),
                 "usage_tier": "consultation_only",
                 "cap": result.cap,
                 "used": result.used,
-                "retry_after": None,
+                "retry_after": retry_after,
             }
         },
     )
@@ -787,9 +854,7 @@ async def _responses_impl(
         )
     body = dict(body)
     if "messages" not in body:
-        input_value = body.get("input", "")
-        content = input_value if isinstance(input_value, str) else str(input_value)
-        body["messages"] = [{"role": "user", "content": content}]
+        body["messages"] = _responses_input_to_messages(body.get("input", ""))
     body.pop("input", None)
     result = await _chat_completions_impl(request, body, user)
     if not isinstance(result, JSONResponse):

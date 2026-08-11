@@ -201,15 +201,20 @@ async def write_routing_audit(payload: dict[str, Any], metadata: dict[str, Any])
     The table is the canonical PANTHEON telemetry sink; MEMORY rows are no
     longer used for routing audit events.
     """
+    await _write_routing_audit(payload, metadata)
+
+
+async def _write_routing_audit(payload: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    """Return whether the canonical audit row was persisted."""
     try:
         record = routing_audit_record(payload, metadata)
         backend = _lc._persistence_backend
         if backend is not None and await insert_routing_audit_record(backend, record):
-            return
+            return True
 
         pool = _lc._pool
         if pool is None:
-            return
+            return False
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -230,8 +235,10 @@ async def write_routing_audit(payload: dict[str, Any], metadata: dict[str, Any])
                 record["error_class"],
                 record["payload_json"],
             )
+        return True
     except Exception as exc:
         logger.debug("[PANTHEON] routing-audit write failed: %s", exc)
+        return False
 
 
 async def write_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
@@ -265,8 +272,10 @@ async def _drain_routing_log_queue() -> None:
             except asyncio.QueueEmpty:
                 return
             try:
-                await write_routing_audit(item.payload, item.metadata)
-                await publish_routing_event(item.payload, item.metadata)
+                persisted = await _write_routing_audit(item.payload, item.metadata)
+                event_metadata = dict(item.metadata)
+                event_metadata["audit_persisted"] = persisted
+                await publish_routing_event(item.payload, event_metadata)
             finally:
                 queue.task_done()
     finally:

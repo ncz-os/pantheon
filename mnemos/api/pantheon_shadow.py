@@ -76,6 +76,11 @@ async def _shadow_lifespan(shadow_app: FastAPI) -> AsyncIterator[None]:
     import mnemos.core.lifecycle as lifecycle
 
     settings = get_settings()
+    if not settings.pantheon.shadow_no_auth and not settings.auth.enabled:
+        raise RuntimeError(
+            "PANTHEON authenticated mode requires MNEMOS_AUTH_ENABLED=true; "
+            "use MNEMOS_PANTHEON_SHADOW_NO_AUTH=true only for direct loopback validation"
+        )
     owned_backend = None
     if lifecycle._persistence_backend is None:
         _, owned_backend = await lifecycle.build_configured_persistence_backend(settings)

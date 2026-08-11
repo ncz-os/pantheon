@@ -32,6 +32,13 @@ def test_pantheon_gunicorn_launcher_is_multi_worker_and_loopback_only() -> None:
     assert "MNEMOS_PANTHEON_GATEWAY_RATE_LIMIT" in launcher
 
 
+def test_pantheon_production_environment_enables_core_auth() -> None:
+    environment = (PANTHEON_DEPLOY / "pantheon-gunicorn.env.example").read_text(encoding="utf-8")
+
+    assert "MNEMOS_PANTHEON_SHADOW_NO_AUTH=false" in environment
+    assert "MNEMOS_AUTH_ENABLED=true" in environment
+
+
 def test_pantheon_caddy_snippet_keeps_vip_and_documents_rollback() -> None:
     snippet = (PANTHEON_DEPLOY / "Caddyfile.pantheon-vip-4100.snippet").read_text(encoding="utf-8")
 

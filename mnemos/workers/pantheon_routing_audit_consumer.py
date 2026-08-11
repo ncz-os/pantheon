@@ -49,6 +49,9 @@ async def _ack(msg: Any) -> None:
 async def handle_message(backend: Any, msg: Any) -> None:
     event = _decode_event(getattr(msg, "data", b""))
     metadata = dict(event.pop("metadata"))
+    if metadata.get("audit_persisted") is True:
+        await _ack(msg)
+        return
     record = routing_audit_record(event, metadata)
     if not await insert_routing_audit_record(backend, record):
         raise RuntimeError("persistence backend does not support PANTHEON routing audits")

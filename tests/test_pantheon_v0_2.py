@@ -238,7 +238,9 @@ async def test_agentic_cap_blocks_fifty_first_same_session(pantheon_v02_client):
     error = blocked.json()["error"]
     assert error["usage_tier"] == "consultation_only"
     assert error["cap"] == 50
-    assert "retry_after" in error
+    assert error["retry_after"] > 0
+    assert int(blocked.headers["Retry-After"]) == error["retry_after"]
+    assert "hourly window" in error["message"]
 
 
 @pytest.mark.asyncio
@@ -362,6 +364,122 @@ async def test_routing_audit_writer_lands_on_sqlite_backend(monkeypatch, tmp_pat
     payload_json = json.loads(row["payload"])
     assert payload_json["request_id"] == "req-sqlite-audit"
     assert payload_json["metadata"]["session_id"] == "sqlite-session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("publish_enabled", "consumer_enabled"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+async def test_routing_audit_marks_successful_direct_write_for_every_pipeline_flag_combination(
+    monkeypatch, publish_enabled, consumer_enabled
+):
+    from mnemos.domain.pantheon import routing_log
+
+    writes = []
+    publishes = []
+    settings = SimpleNamespace(
+        pantheon=SimpleNamespace(routing_log_queue_size=10, routing_log_drain_workers=1),
+        nats=SimpleNamespace(
+            publish_pantheon_routing=publish_enabled,
+            audit_consumer_enabled=consumer_enabled,
+        )
+    )
+
+    async def _write(payload, metadata):
+        writes.append((payload, metadata))
+        return True
+
+    async def _publish(payload, metadata):
+        publishes.append((payload, metadata))
+
+    monkeypatch.setattr(routing_log, "get_settings", lambda: settings)
+    monkeypatch.setattr(routing_log, "_write_routing_audit", _write)
+    monkeypatch.setattr(routing_log, "publish_routing_event", _publish)
+    monkeypatch.setattr(routing_log, "_routing_log_queue", asyncio.Queue(maxsize=10))
+    monkeypatch.setattr(routing_log, "_routing_log_drainers", 1)
+    routing_log._routing_log_queue.put_nowait(
+        routing_log._RoutingLogItem({"request_id": "req-1"}, {"schema_version": "1"})
+    )
+
+    await routing_log._drain_routing_log_queue()
+
+    assert len(writes) == 1
+    assert len(publishes) == 1
+    assert publishes[0][1]["audit_persisted"] is True
+
+
+@pytest.mark.asyncio
+async def test_audit_consumer_skips_event_already_persisted_by_publisher():
+    from mnemos.workers.pantheon_routing_audit_consumer import handle_message
+
+    class Message:
+        def __init__(self):
+            self.acked = False
+            self.data = json.dumps(
+                {
+                    "request_id": "req-direct",
+                    "tenant_user_id": "alice",
+                    "alias_or_model": "cheap-chat",
+                    "resolved_to": "cheap-chat",
+                    "outcome": "success",
+                    "metadata": {"schema_version": "1", "audit_persisted": True},
+                }
+            ).encode()
+
+        async def ack(self):
+            self.acked = True
+
+    class Backend:
+        def transactional(self):
+            raise AssertionError("consumer must not insert an already-persisted event")
+
+    message = Message()
+    await handle_message(Backend(), message)
+
+    assert message.acked is True
+
+
+@pytest.mark.asyncio
+async def test_audit_consumer_recovers_event_when_direct_write_failed():
+    from contextlib import asynccontextmanager
+
+    from mnemos.workers.pantheon_routing_audit_consumer import handle_message
+
+    class Message:
+        def __init__(self):
+            self.acked = False
+            self.data = json.dumps(
+                {
+                    "request_id": "req-recovery",
+                    "tenant_user_id": "alice",
+                    "alias_or_model": "cheap-chat",
+                    "resolved_to": "cheap-chat",
+                    "outcome": "success",
+                    "metadata": {"schema_version": "1", "audit_persisted": False},
+                }
+            ).encode()
+
+        async def ack(self):
+            self.acked = True
+
+    class Backend:
+        def __init__(self):
+            self.records = []
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield object()
+
+        async def insert_pantheon_routing_audit(self, _tx, record):
+            self.records.append(record)
+
+    backend = Backend()
+    message = Message()
+    await handle_message(backend, message)
+
+    assert message.acked is True
+    assert [record["request_id"] for record in backend.records] == ["req-recovery"]
 
 
 @pytest.mark.asyncio

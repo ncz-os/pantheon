@@ -39,6 +39,7 @@ DEFAULT_CAP_BUCKET = "MNEMOS_PANTHEON_CONSULTATION_CAPS"
 _PENDING_LIMIT = 1024
 _COUNTER_TTL_SECONDS = 180
 _LOCK_TTL_SECONDS = 120
+_CAP_TTL_SECONDS = 3600
 _SYNC_TIMEOUT_SECONDS = 0.25
 _CAS_ATTEMPTS = 16
 _CAP_CAS_ATTEMPTS = 256
@@ -240,10 +241,11 @@ class NatsJetStreamCooldownStore(CooldownStore):
         self._ready_counter = self._track(self._loop.submit(self._ensure_kv(js, self._bucket_name, counter_ttl_seconds)))
         self._ready_cooldown = self._track(self._loop.submit(self._ensure_kv(js, self._cooldown_bucket_name, 86400)))
         self._ready_lock = self._track(self._loop.submit(self._ensure_kv(js, self._lock_bucket_name, lock_ttl_seconds)))
-        # A consultation cap is per trusted session, not per time window.  A
-        # bucket TTL would silently mint a fresh allowance, so ttl=0 means no
-        # expiry in JetStream.
-        self._ready_cap = self._track(self._loop.submit(self._ensure_kv(js, self._cap_bucket_name, 0)))
+        # Cap keys contain a server-derived hourly window. Matching KV expiry
+        # bounds storage and prevents stale allowances from surviving forever.
+        self._ready_cap = self._track(
+            self._loop.submit(self._ensure_kv(js, self._cap_bucket_name, _CAP_TTL_SECONDS))
+        )
 
     async def _ensure_kv(self, js: Any | None, bucket: str, ttl_seconds: int) -> Any | None:
         if js is None:
@@ -251,7 +253,20 @@ class NatsJetStreamCooldownStore(CooldownStore):
         if js is None:
             logger.warning("PANTHEON NATS cooldown store unavailable; durable sharing disabled")
             return None
-        return await self._get_or_create_bucket(js, bucket, ttl_seconds)
+        kv = await self._get_or_create_bucket(js, bucket, ttl_seconds)
+        if ttl_seconds > 0 and all(hasattr(js, name) for name in ("stream_info", "update_stream")):
+            # Existing KV buckets keep their original stream max_age. Reconcile
+            # it so upgrades from the old ttl=0 consultation bucket actually
+            # apply to already-populated deployments.
+            try:
+                info = await _maybe_await(js.stream_info(f"KV_{bucket}"))
+                config = info.config
+                if abs(float(getattr(config, "max_age", 0) or 0) - float(ttl_seconds)) > 1e-3:
+                    config.max_age = float(ttl_seconds)
+                    await _maybe_await(js.update_stream(config=config))
+            except Exception as exc:
+                logger.warning("PANTHEON NATS KV TTL reconciliation failed for %s: %s", bucket, exc)
+        return kv
 
     async def _connect_jetstream(self) -> Any | None:
         settings = get_settings()

@@ -27,7 +27,10 @@ def test_shadow_lifespan_owns_configured_persistence_backend(monkeypatch):
     async def _stop_refresh():
         return None
 
-    settings = SimpleNamespace(pantheon=SimpleNamespace(shadow_no_auth=False))
+    settings = SimpleNamespace(
+        pantheon=SimpleNamespace(shadow_no_auth=False),
+        auth=SimpleNamespace(enabled=True),
+    )
     monkeypatch.setattr(lifecycle, "_persistence_backend", None)
     monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", _build)
     monkeypatch.setattr(pantheon_shadow, "get_settings", lambda: settings)
@@ -44,6 +47,30 @@ def test_shadow_lifespan_owns_configured_persistence_backend(monkeypatch):
 
     asyncio.run(_run())
     assert backend.closed is True
+
+
+def test_shadow_lifespan_refuses_authenticated_mode_when_auth_is_disabled(monkeypatch):
+    import mnemos.core.lifecycle as lifecycle
+    from mnemos.api import pantheon_shadow
+
+    settings = SimpleNamespace(
+        pantheon=SimpleNamespace(shadow_no_auth=False),
+        auth=SimpleNamespace(enabled=False),
+    )
+
+    async def _must_not_build(_settings):
+        raise AssertionError("unsafe configuration must fail before opening persistence")
+
+    monkeypatch.setattr(lifecycle, "_persistence_backend", None)
+    monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", _must_not_build)
+    monkeypatch.setattr(pantheon_shadow, "get_settings", lambda: settings)
+
+    async def _run():
+        with pytest.raises(RuntimeError, match="MNEMOS_AUTH_ENABLED=true"):
+            async with pantheon_shadow._shadow_lifespan(FastAPI()):
+                pass
+
+    asyncio.run(_run())
 
 
 def test_shadow_health_fails_when_persistence_is_unavailable(monkeypatch):
