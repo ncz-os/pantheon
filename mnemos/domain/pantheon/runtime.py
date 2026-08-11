@@ -24,6 +24,7 @@ Resilience choices:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
@@ -35,6 +36,8 @@ from mnemos.domain.pantheon.fallback import (
     FallbackResult,
     execute_with_fallbacks,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RouterRuntime:
@@ -145,7 +148,17 @@ class RouterRuntime:
                 err = classify(exc)
                 await record_failure(deployment, err, now)
                 raise
-            await record_success(deployment, self._clock())
+            try:
+                await record_success(deployment, self._clock())
+            except Exception as exc:  # noqa: BLE001 - post-success telemetry is best effort
+                # The provider operation has already succeeded and may be
+                # billable. Never turn a counter-write failure into another
+                # provider attempt; pre-dispatch shared-state readiness and
+                # failure/cooldown writes remain fail-closed.
+                logger.warning(
+                    "PANTHEON cooldown success-counter update failed after upstream success: %s",
+                    exc,
+                )
             return result
 
         return await execute_with_fallbacks(

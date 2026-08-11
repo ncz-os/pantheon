@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from pathlib import Path
 import tomllib
 
@@ -21,9 +20,7 @@ def test_supported_current_core_and_graeae_import_together() -> None:
 
     install_core_graeae_compat()
 
-    assert resilience._redis_requested(
-        SimpleNamespace(rate_limit=SimpleNamespace(storage_uri="redis://localhost/2"))
-    )
+    assert not hasattr(resilience, "_get_lifecycle_redis_client")
     from mnemos.domain.graeae.engine import GraeaeEngine
 
     assert GraeaeEngine is not None
@@ -34,8 +31,17 @@ def test_compat_does_not_replace_core_symbols(monkeypatch) -> None:
     from mnemos.domain.pantheon.fleet_compat import install_core_graeae_compat
 
     sentinel = lambda _settings: "core"  # noqa: E731
-    monkeypatch.setattr(resilience, "_redis_requested", sentinel)
+    monkeypatch.setattr(resilience, "_redis_requested", sentinel, raising=False)
 
     install_core_graeae_compat()
 
     assert resilience._redis_requested is sentinel
+
+
+def test_compat_does_not_synthesize_deleted_core_symbols(monkeypatch) -> None:
+    import mnemos.core.resilience as resilience
+    from mnemos.domain.pantheon.fleet_compat import install_core_graeae_compat
+
+    monkeypatch.delattr(resilience, "_get_lifecycle_redis_client", raising=False)
+    install_core_graeae_compat()
+    assert not hasattr(resilience, "_get_lifecycle_redis_client")

@@ -1,6 +1,6 @@
 """PANTHEON unified LLM facade domain package."""
 
-# Import order is intentional: the compatibility hook must execute before any
+# Import order is intentional: validate the supported fleet seam before any
 # module below imports GRAEAE.
 # ruff: noqa: E402
 
@@ -8,8 +8,8 @@ from mnemos.core.extras import require_extra
 
 require_extra("pantheon")
 
-# Must run before catalog/router import GRAEAE.  This is conditional and leaves
-# a compatible core implementation untouched.
+# Retained for callers that import the fleet hook directly. It deliberately
+# does not install deleted private core symbols.
 from mnemos.domain.pantheon.fleet_compat import install_core_graeae_compat
 
 install_core_graeae_compat()

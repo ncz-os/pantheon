@@ -138,6 +138,7 @@ def test_stale_token_refresh_fails_closed_without_distributed_lock(monkeypatch, 
     monkeypatch.setenv("PANTHEON_CODEX_OAUTH_AUTH_JSON", str(auth_path))
     monkeypatch.setenv("PANTHEON_CODEX_OAUTH_TOKEN_REFRESH_SECONDS", "1")
     monkeypatch.setattr(codex_oauth, "_distributed_lock_store", lambda: None)
+    monkeypatch.setattr(codex_oauth, "_single_worker_local_refresh_allowed", lambda: False)
     monkeypatch.setattr(codex_oauth, "get_http_client", lambda: _Client())
 
     async def _run():
@@ -146,6 +147,91 @@ def test_stale_token_refresh_fails_closed_without_distributed_lock(monkeypatch, 
 
     with pytest.raises(codex_oauth.CodexOAuthUnavailable, match="distributed refresh lock"):
         asyncio.run(_run())
+
+
+def test_stale_token_refresh_uses_process_lock_in_single_worker_local_mode(monkeypatch, tmp_path):
+    auth_path = tmp_path / "auth.json"
+    _write_json(auth_path, _auth_payload(last_refresh="2000-01-01T00:00:00Z"))
+
+    class _Client:
+        async def post(self, *_args, **_kwargs):
+            return _Resp(200, {"access_token": "access-new", "refresh_token": "refresh-new"})
+
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_AUTH_JSON", str(auth_path))
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_TOKEN_REFRESH_SECONDS", "1")
+    monkeypatch.setattr(codex_oauth, "_distributed_lock_store", lambda: None)
+    monkeypatch.setattr(codex_oauth, "_single_worker_local_refresh_allowed", lambda: True)
+    monkeypatch.setattr(codex_oauth, "get_http_client", lambda: _Client())
+
+    state = asyncio.run(codex_oauth.TokenManager().access_state())
+
+    assert state.access_token == "access-new"
+
+
+@pytest.mark.parametrize("profile", ["server", "edge", "dev", "personal"])
+def test_process_refresh_lock_is_safe_for_default_single_worker_profiles(monkeypatch, profile):
+    from mnemos.core.config import _reset_settings_for_tests
+
+    monkeypatch.setenv("MNEMOS_PROFILE", profile)
+    monkeypatch.delenv("MNEMOS_NATS_URL", raising=False)
+    monkeypatch.delenv("MNEMOS_WORKERS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    _reset_settings_for_tests()
+    try:
+        assert codex_oauth._single_worker_local_refresh_allowed() is True
+    finally:
+        _reset_settings_for_tests()
+
+
+@pytest.mark.parametrize("worker_env", [("MNEMOS_WORKERS", "2"), ("WEB_CONCURRENCY", "4")])
+def test_process_refresh_lock_is_unsafe_for_multi_worker_modes(monkeypatch, worker_env):
+    from mnemos.core.config import _reset_settings_for_tests
+
+    monkeypatch.delenv("MNEMOS_NATS_URL", raising=False)
+    monkeypatch.setenv(*worker_env)
+    _reset_settings_for_tests()
+    try:
+        assert codex_oauth._single_worker_local_refresh_allowed() is False
+    finally:
+        _reset_settings_for_tests()
+
+
+def test_peer_refresh_timeout_never_returns_unchanged_stale_token(monkeypatch, tmp_path):
+    auth_path = tmp_path / "auth.json"
+    _write_json(auth_path, _auth_payload(last_refresh="2000-01-01T00:00:00Z"))
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_AUTH_JSON", str(auth_path))
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_LOCK_WAIT_SECONDS", "0")
+
+    config = codex_oauth.get_config()
+    before = codex_oauth.read_auth_state(config)
+    assert before is not None
+
+    with pytest.raises(codex_oauth.CodexOAuthUnavailable, match="peer refresh did not complete"):
+        asyncio.run(codex_oauth.TokenManager()._wait_for_peer_refresh(config, before))
+
+
+def test_refresh_rejects_lock_ttl_not_longer_than_http_timeout(monkeypatch, tmp_path):
+    auth_path = tmp_path / "auth.json"
+    _write_json(auth_path, _auth_payload(last_refresh="2000-01-01T00:00:00Z"))
+
+    class _LockStore:
+        async def atry_acquire_lock(self, *_args, **_kwargs):
+            raise AssertionError("invalid lease must fail before acquisition")
+
+        async def arelease_lock(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_AUTH_JSON", str(auth_path))
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_TOKEN_REFRESH_SECONDS", "1")
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_LOCK_TTL_SECONDS", "60")
+    monkeypatch.setenv("PANTHEON_CODEX_OAUTH_TIMEOUT_SECONDS", "60")
+    monkeypatch.setattr(codex_oauth, "_distributed_lock_store", lambda: _LockStore())
+
+    with pytest.raises(codex_oauth.CodexOAuthUnavailable, match="TTL must exceed"):
+        asyncio.run(codex_oauth.TokenManager().access_state())
 
 
 def test_codex_stream_open_uses_configured_timeout(monkeypatch, tmp_path):

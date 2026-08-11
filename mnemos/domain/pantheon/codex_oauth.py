@@ -34,7 +34,7 @@ DEFAULT_CLIENT_VERSION = "0.131.0"
 DEFAULT_TOKEN_REFRESH_SECONDS = 50 * 60
 DEFAULT_CATALOG_REFRESH_SECONDS = 10 * 60
 DEFAULT_LOCK_WAIT_SECONDS = 10.0
-DEFAULT_LOCK_TTL_SECONDS = 60.0
+DEFAULT_LOCK_TTL_SECONDS = 120.0
 DEFAULT_TIMEOUT_SECONDS = 60.0
 _AUTH_REFRESH_LOCK = "pantheon:codex-oauth:auth-refresh"
 _TRUTHY = {"1", "true", "yes", "y", "on", "enabled"}
@@ -332,6 +332,26 @@ def _distributed_lock_store() -> Any | None:
     return store if getattr(store, "atry_acquire_lock", None) is not None else None
 
 
+def _single_worker_local_refresh_allowed() -> bool:
+    """Return whether a process-local refresh lock is deployment-wide."""
+    try:
+        from mnemos.core.config import get_settings
+
+        settings = get_settings()
+        if str(settings.nats.url or "").strip():
+            return False
+        workers = int(settings.server.workers)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    web_concurrency = os.getenv("WEB_CONCURRENCY", "").strip()
+    if web_concurrency:
+        try:
+            workers = max(workers, int(web_concurrency))
+        except ValueError:
+            return False
+    return workers == 1
+
+
 async def _release_distributed_lock(store: Any | None, owner: str) -> None:
     release = getattr(store, "arelease_lock", None)
     if release is None:
@@ -364,8 +384,17 @@ class TokenManager:
                 return state
             owner = f"{os.getpid()}:{uuid.uuid4().hex}"
             lock_store = _distributed_lock_store()
-            if lock_store is None and config.require_distributed_refresh_lock:
+            if (
+                lock_store is None
+                and config.require_distributed_refresh_lock
+                and not _single_worker_local_refresh_allowed()
+            ):
                 raise CodexOAuthUnavailable("Codex OAuth distributed refresh lock unavailable")
+            minimum_lock_ttl = config.timeout_seconds + config.lock_wait_seconds
+            if lock_store is not None and config.lock_ttl_seconds <= minimum_lock_ttl:
+                raise CodexOAuthUnavailable(
+                    "Codex OAuth refresh lock TTL must exceed the refresh HTTP timeout plus lock wait"
+                )
             if lock_store is not None and not await _try_acquire_distributed_lock(lock_store, config, owner):
                 return await self._wait_for_peer_refresh(config, state)
             try:
@@ -392,10 +421,9 @@ class TokenManager:
             )
             if current.access_token and changed:
                 return current
-        current = read_auth_state(config)
-        if current is not None and current.access_token:
-            return current
-        raise CodexOAuthUnavailable("Codex OAuth refresh did not complete")
+        raise CodexOAuthUnavailable(
+            "Codex OAuth peer refresh did not complete before the lock wait deadline"
+        )
 
     async def _refresh_locked(self, config: CodexOAuthConfig, state: AuthState) -> AuthState:
         if not state.refresh_token:

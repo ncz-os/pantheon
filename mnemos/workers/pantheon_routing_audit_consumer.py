@@ -92,6 +92,7 @@ async def consumer_loop(
     settings: Any | None = None,
     retry_seconds: float = 30.0,
     connect: Callable[[Any], Awaitable[tuple[Any, Any]]] | None = None,
+    ready_event: asyncio.Event | None = None,
 ) -> None:
     """Consume routing events until cancelled, reconnecting after broker errors."""
     settings = settings or get_settings()
@@ -111,6 +112,8 @@ async def consumer_loop(
                 PANTHEON_ROUTING_SUBJECT,
                 durable=DURABLE,
             )
+            if ready_event is not None:
+                ready_event.set()
             delay = 1.0
             while True:
                 try:
@@ -129,9 +132,13 @@ async def consumer_loop(
                 except Exception:
                     logger.exception("PANTHEON routing audit event write failed")
         except asyncio.CancelledError:
+            if ready_event is not None:
+                ready_event.clear()
             await _drain(client, subscription)
             raise
         except Exception as exc:
+            if ready_event is not None:
+                ready_event.clear()
             await _drain(client, subscription)
             logger.warning("PANTHEON routing audit consumer unavailable: %s", exc)
             await asyncio.sleep(delay)

@@ -12,6 +12,7 @@ the configured auth dependency instead.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from typing import Any
@@ -82,11 +83,18 @@ async def _shadow_lifespan(shadow_app: FastAPI) -> AsyncIterator[None]:
             "use MNEMOS_PANTHEON_SHADOW_NO_AUTH=true only for direct loopback validation"
         )
     owned_backend = None
+    owned_pool = None
+    nats_jetstream = None
+    audit_consumer_task: asyncio.Task[None] | None = None
+    audit_consumer_ready: asyncio.Event | None = None
     if lifecycle._persistence_backend is None:
-        _, owned_backend = await lifecycle.build_configured_persistence_backend(settings)
+        backend_type, owned_backend = await lifecycle.build_configured_persistence_backend(settings)
         lifecycle._persistence_backend = owned_backend
+        if backend_type == "postgres":
+            owned_pool = getattr(owned_backend, "_pool", None)
+            lifecycle._pool = owned_pool
     shadow_app.state.persistence_backend = lifecycle._persistence_backend
-    shadow_app.state.pool = getattr(lifecycle._persistence_backend, "_pool", None)
+    shadow_app.state.pool = lifecycle._pool
     previous_override: Any = _MISSING
     codex_oauth = None
     try:
@@ -94,7 +102,26 @@ async def _shadow_lifespan(shadow_app: FastAPI) -> AsyncIterator[None]:
             previous_override = shadow_app.dependency_overrides.get(get_current_user, _MISSING)
             shadow_app.dependency_overrides[get_current_user] = _shadow_current_user
         else:
-            configure_auth(None)
+            configure_auth(lifecycle._pool)
+        nats_settings = getattr(settings, "nats", None)
+        if nats_settings is not None:
+            from mnemos.nats import connect_nats
+
+            nats_jetstream = await connect_nats(nats_settings.url, nats_settings.token)
+            if nats_settings.audit_consumer_enabled:
+                from mnemos.workers.pantheon_routing_audit_consumer import consumer_loop
+
+                audit_consumer_ready = asyncio.Event()
+                audit_consumer_task = asyncio.create_task(
+                    consumer_loop(
+                        lifecycle._persistence_backend,
+                        settings=settings,
+                        ready_event=audit_consumer_ready,
+                    ),
+                    name="pantheon-routing-audit-consumer",
+                )
+        shadow_app.state.audit_consumer_task = audit_consumer_task
+        shadow_app.state.audit_consumer_ready = audit_consumer_ready
         try:
             from mnemos.domain.pantheon import codex_oauth as _codex_oauth
 
@@ -104,6 +131,9 @@ async def _shadow_lifespan(shadow_app: FastAPI) -> AsyncIterator[None]:
             codex_oauth = None
         yield
     finally:
+        if audit_consumer_task is not None:
+            audit_consumer_task.cancel()
+            await asyncio.gather(audit_consumer_task, return_exceptions=True)
         if codex_oauth is not None:
             await codex_oauth.stop_background_refresh()
         if settings.pantheon.shadow_no_auth:
@@ -115,8 +145,19 @@ async def _shadow_lifespan(shadow_app: FastAPI) -> AsyncIterator[None]:
             try:
                 await owned_backend.close()
             finally:
+                if lifecycle._pool is owned_pool:
+                    lifecycle._pool = None
                 if lifecycle._persistence_backend is owned_backend:
                     lifecycle._persistence_backend = None
+        if nats_jetstream is not None:
+            # connect_nats returns the nats-py JetStream context. Core does not
+            # expose a shutdown helper, so close the verified owning connection
+            # carried by that context rather than leaving it behind on lifespan
+            # restarts.
+            nats_client = getattr(nats_jetstream, "_nc", None)
+            drain = getattr(nats_client, "drain", None)
+            if drain is not None:
+                await drain()
 
 
 app = FastAPI(
@@ -137,15 +178,35 @@ async def health() -> dict[str, object]:
     from mnemos.domain.pantheon import gateway
     from mnemos.domain.pantheon.shared_state import SharedStateUnavailable
 
-    if lifecycle._persistence_backend is None:
+    backend = lifecycle._persistence_backend
+    if backend is None:
         raise HTTPException(status_code=503, detail="persistence backend unavailable")
+    try:
+        database_ok = bool(await asyncio.wait_for(backend.ping(), timeout=5.0))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"persistence backend unhealthy: {exc}") from exc
+    if not database_ok:
+        raise HTTPException(status_code=503, detail="persistence backend unhealthy")
     try:
         await gateway.require_shared_state()
     except SharedStateUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    settings = get_settings().pantheon
+    all_settings = get_settings()
+    settings = all_settings.pantheon
+    nats_settings = getattr(all_settings, "nats", None)
+    if nats_settings is not None and nats_settings.publish_pantheon_routing:
+        from mnemos.nats.client import publishing_enabled
+
+        if not publishing_enabled():
+            raise HTTPException(status_code=503, detail="routing audit publisher unavailable")
+    audit_task = getattr(app.state, "audit_consumer_task", None)
+    audit_ready = getattr(app.state, "audit_consumer_ready", None)
+    if nats_settings is not None and nats_settings.audit_consumer_enabled:
+        if audit_task is None or audit_task.done() or audit_ready is None or not audit_ready.is_set():
+            raise HTTPException(status_code=503, detail="routing audit consumer unavailable")
     return {
         "status": "ok",
+        "components": {"database": "ok", "shared_state": "ok"},
         "service": "pantheon-shadow",
         "shadow_port": settings.shadow_port,
         "shadow_no_auth": settings.shadow_no_auth,

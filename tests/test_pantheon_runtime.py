@@ -64,6 +64,33 @@ def test_success_records_success_and_returns():
     assert mgr._store.get_counts("_default", "a", int(NOW // 60)) == (1, 0)  # noqa: SLF001
 
 
+def test_success_counter_failure_does_not_repeat_successful_provider_call():
+    class _FailingSuccessStore(InMemoryCooldownStore):
+        async def aget_cooled_until(self, tenant, deployment):
+            return self.get_cooled_until(tenant, deployment)
+
+        async def aincr(self, tenant, deployment, minute, *, success):
+            assert success is True
+            raise RuntimeError("NATS counter unavailable")
+
+    calls = []
+
+    async def call(deployment):
+        calls.append(deployment)
+        return "billable-success"
+
+    runtime = RouterRuntime(
+        CooldownManager(_FailingSuccessStore()),
+        clock=lambda: NOW,
+        sleep=_noop_sleep,
+        rng=lambda: 0.0,
+    )
+    result = asyncio.run(runtime.route(["a", "b"], call, classify=_classify))
+
+    assert result.result == "billable-success"
+    assert calls == ["a"]
+
+
 def test_429_trips_cooldown_then_prefiltered_next_route():
     rt, mgr = _runtime()
     # first route: a 429s (multi-group -> trips), b serves
