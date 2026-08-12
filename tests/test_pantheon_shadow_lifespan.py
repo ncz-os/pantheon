@@ -7,6 +7,25 @@ import pytest
 from fastapi import FastAPI, HTTPException
 
 
+_configure_auth_calls: list = []
+
+
+def _record_configure_auth(config=None):
+    """Stand-in for mnemos.api.dependencies.configure_auth.
+
+    Deliberately mirrors the real signature `configure_auth(config: dict | None)`.
+    The previous stubs took a pool (`lambda _pool: ...`), which meant the suite
+    asserted the broken call shape was correct and stayed green while an
+    auth-enabled shadow gateway died at startup on `config.get(...)`.
+    """
+    assert config is None or isinstance(config, dict), (
+        f"configure_auth must receive a dict or None, got {type(config).__name__}"
+    )
+    _configure_auth_calls.append(config)
+
+
+
+
 @pytest.mark.parametrize("backend_type", ["sqlite", "oracle", "db2", "mysql", "mariadb"])
 def test_shadow_lifespan_owns_configured_non_postgres_backend(monkeypatch, backend_type):
     import mnemos.core.lifecycle as lifecycle
@@ -37,7 +56,7 @@ def test_shadow_lifespan_owns_configured_non_postgres_backend(monkeypatch, backe
     monkeypatch.setattr(lifecycle, "_pool", None)
     monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", _build)
     monkeypatch.setattr(pantheon_shadow, "get_settings", lambda: settings)
-    monkeypatch.setattr(pantheon_shadow, "configure_auth", lambda _pool: None)
+    monkeypatch.setattr(pantheon_shadow, "configure_auth", _record_configure_auth)
     monkeypatch.setattr(codex_oauth, "start_background_refresh", lambda: None)
     monkeypatch.setattr(codex_oauth, "stop_background_refresh", _stop_refresh)
 
@@ -112,7 +131,7 @@ def test_shadow_lifespan_exposes_only_postgres_pool_and_bootstraps_nats(monkeypa
     monkeypatch.setattr(lifecycle, "_pool", None)
     monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", _build)
     monkeypatch.setattr(pantheon_shadow, "get_settings", lambda: settings)
-    monkeypatch.setattr(pantheon_shadow, "configure_auth", lambda active_pool: active_pool is pool)
+    monkeypatch.setattr(pantheon_shadow, "configure_auth", _record_configure_auth)
     monkeypatch.setattr(mnemos.nats, "connect_nats", _connect)
     monkeypatch.setattr(pantheon_routing_audit_consumer, "consumer_loop", _consumer)
     monkeypatch.setattr(codex_oauth, "start_background_refresh", lambda: None)

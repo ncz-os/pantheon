@@ -102,7 +102,11 @@ async def _shadow_lifespan(shadow_app: FastAPI) -> AsyncIterator[None]:
             previous_override = shadow_app.dependency_overrides.get(get_current_user, _MISSING)
             shadow_app.dependency_overrides[get_current_user] = _shadow_current_user
         else:
-            configure_auth(lifecycle._pool)
+            # Core calls this with None (mnemos/core/lifecycle.py:877); the
+            # signature is configure_auth(config: dict | None). Passing an
+            # asyncpg Pool made it call config.get(...) on a Pool, which has no
+            # .get, so an auth-enabled shadow gateway died at startup.
+            configure_auth(None)
         nats_settings = getattr(settings, "nats", None)
         if nats_settings is not None:
             from mnemos.nats import connect_nats
