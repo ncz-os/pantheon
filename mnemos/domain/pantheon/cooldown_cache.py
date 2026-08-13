@@ -57,6 +57,9 @@ class WriteBehindCooldownStore(CooldownStore):
         self._l1.set_cooldown(tenant, deployment, cooled_until)
         self._buffer(("cooldown", tenant, deployment, cooled_until))
 
+    def discard_expired_cooldown(self, tenant: str, deployment: str, now: float) -> None:
+        self._l1.discard_expired_cooldown(tenant, deployment, now)
+
     # ── counters: L1-authoritative per process+minute, buffered deltas ────
     def incr(self, tenant: str, deployment: str, minute: int, *, success: bool) -> None:
         self._l1.incr(tenant, deployment, minute, success=success)

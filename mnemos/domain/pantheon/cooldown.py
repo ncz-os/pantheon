@@ -32,7 +32,9 @@ on a permanent auth/not-found error, or when the failure rate exceeds 50% over
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 from threading import Lock
 
@@ -50,6 +52,17 @@ _PERMANENT_CLASSES: frozenset[ErrorClass] = frozenset(
 )
 
 DEFAULT_TENANT: str = "_default"
+DEFAULT_L1_MAX_ENTRIES: int = 25_000
+
+
+def _default_l1_max_entries() -> int:
+    raw = os.environ.get("MNEMOS_PANTHEON_COOLDOWN_L1_MAX_ENTRIES")
+    if raw is None:
+        return DEFAULT_L1_MAX_ENTRIES
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_L1_MAX_ENTRIES
 
 
 @dataclass(frozen=True)
@@ -112,6 +125,14 @@ class CooldownStore(ABC):
     def set_cooldown(self, tenant: str, deployment: str, cooled_until: float) -> None:
         """Record that the deployment is cooled until ``cooled_until``."""
 
+    def discard_expired_cooldown(self, tenant: str, deployment: str, now: float) -> None:
+        """Drop an expired process-local cooldown, if this store owns one.
+
+        Durable implementations may leave their logical-TTL row in place.  The
+        default no-op keeps the extension backward compatible for external
+        ``CooldownStore`` implementations.
+        """
+
     @abstractmethod
     def incr(self, tenant: str, deployment: str, minute: int, *, success: bool) -> None:
         """Atomically increment the success/failure counter for the minute bucket."""
@@ -124,18 +145,34 @@ class CooldownStore(ABC):
 class InMemoryCooldownStore(CooldownStore):
     """Process-local reference store (the L1). Thread-safe, no durable tier."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_entries: int | None = None) -> None:
         self._lock = Lock()
-        self._cooled: dict[tuple[str, str], float] = {}
+        self._max_entries = max(1, max_entries if max_entries is not None else _default_l1_max_entries())
+        self._cooled: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._counts: dict[tuple[str, str, int], list[int]] = {}
 
     def get_cooled_until(self, tenant: str, deployment: str) -> float | None:
         with self._lock:
-            return self._cooled.get((tenant, deployment))
+            key = (tenant, deployment)
+            value = self._cooled.get(key)
+            if value is not None:
+                self._cooled.move_to_end(key)
+            return value
 
     def set_cooldown(self, tenant: str, deployment: str, cooled_until: float) -> None:
         with self._lock:
-            self._cooled[(tenant, deployment)] = cooled_until
+            key = (tenant, deployment)
+            self._cooled[key] = cooled_until
+            self._cooled.move_to_end(key)
+            while len(self._cooled) > self._max_entries:
+                self._cooled.popitem(last=False)
+
+    def discard_expired_cooldown(self, tenant: str, deployment: str, now: float) -> None:
+        with self._lock:
+            key = (tenant, deployment)
+            cooled_until = self._cooled.get(key)
+            if cooled_until is not None and cooled_until <= now:
+                del self._cooled[key]
 
     def incr(self, tenant: str, deployment: str, minute: int, *, success: bool) -> None:
         with self._lock:
@@ -171,7 +208,12 @@ class CooldownManager:
 
     def is_cooled(self, deployment: str, now: float, *, tenant: str = DEFAULT_TENANT) -> bool:
         cooled_until = self._store.get_cooled_until(tenant, deployment)
-        return cooled_until is not None and cooled_until > now
+        if cooled_until is None:
+            return False
+        if cooled_until > now:
+            return True
+        self._store.discard_expired_cooldown(tenant, deployment, now)
+        return False
 
     def filter_available(self, deployments: list[str], now: float, *, tenant: str = DEFAULT_TENANT) -> list[str]:
         """Return the deployments not currently cooled (preserving order)."""

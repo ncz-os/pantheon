@@ -599,13 +599,13 @@ def _stream_usage_response(
     model: str,
     usage: dict[str, int] | None,
     fallback_prompt_tokens: int,
-    completion_text: str,
+    completion_chars: int,
 ) -> dict[str, Any] | None:
-    if usage is None and not completion_text:
+    if usage is None and completion_chars <= 0:
         return None
     response_usage = usage or {
         "prompt_tokens": fallback_prompt_tokens,
-        "completion_tokens": _approx_text_tokens(completion_text),
+        "completion_tokens": max(0, int((completion_chars + 3) / 4)),
     }
     response_usage.setdefault("total_tokens", response_usage["prompt_tokens"] + response_usage["completion_tokens"])
     return {"model": model, "usage": response_usage}
@@ -715,20 +715,20 @@ async def _chat_completions_impl(
                 stream_buffer = ""
                 wire_model: str | None = None
                 usage: dict[str, int] | None = None
-                completion_text = ""
+                completion_chars = 0
                 outcome = "success"
                 error_class: str | None = None
                 fallback_prompt_tokens = _approx_prompt_tokens(body)
 
                 def ingest_event(event: str) -> None:
-                    nonlocal completion_text, usage, wire_model
+                    nonlocal completion_chars, usage, wire_model
                     event_model = _stream_event_wire_model(event)
                     if event_model:
                         wire_model = event_model
                     event_usage = _stream_event_usage(event)
                     if event_usage is not None:
                         usage = event_usage
-                    completion_text += _stream_event_completion_text(event)
+                    completion_chars += len(_stream_event_completion_text(event))
 
                 try:
                     async for chunk in gateway.stream_chat_completion(decision, forward_body):
@@ -760,7 +760,7 @@ async def _chat_completions_impl(
                         model=wire_model or decision.model_id or decision.alias,
                         usage=usage,
                         fallback_prompt_tokens=fallback_prompt_tokens,
-                        completion_text=completion_text,
+                        completion_chars=completion_chars,
                     )
                     try:
                         await _log_route_outcome(

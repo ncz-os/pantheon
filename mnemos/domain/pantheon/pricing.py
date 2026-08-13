@@ -602,7 +602,7 @@ async def regenerate_catalog_cache(
     and left untouched. This gives the timer safe staleness semantics: last-good
     survives transient external outages.
     """
-    from mnemos.domain.pantheon.catalog import list_models
+    from mnemos.domain.pantheon.catalog import invalidate_catalog_snapshot, list_models
 
     base_models = await list_models(use_synced_cache=False)
     records, source_status = await fetch_pricing_records(fetchers=fetchers)
@@ -644,6 +644,7 @@ async def regenerate_catalog_cache(
         write_json_cache(payload, json_path)
         if sqlite_path is not None:
             write_sqlite_cache(payload, sqlite_path)
+        invalidate_catalog_snapshot()
     return payload
 
 

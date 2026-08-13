@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import mnemos.core.lifecycle as _lc
@@ -25,6 +25,7 @@ class RouteDecision:
     rolling_window_minutes: int | None = None
     scores: dict[str, dict[str, Any]] | None = None
     selection_reason: str | None = None
+    catalog_models: tuple[dict[str, Any], ...] | None = field(default=None, repr=False, compare=False)
 
     def explain(self) -> dict[str, Any]:
         selection_reason = self.selection_reason or self.reason
@@ -302,6 +303,7 @@ def _passthrough_decision(model_id: str, settings: Any, models: list[dict[str, A
         ),
         model=_passthrough_model(model_id, provider, settings, models),
         candidates=[model_id],
+        catalog_models=tuple(models),
     )
 
 
@@ -322,7 +324,7 @@ async def route_model(model_or_alias: str, body: dict[str, Any] | None = None) -
     request_body = body or {}
     quality_floor = _body_quality_floor(request_body, settings.default_quality_floor)
     max_cost = _body_max_cost(request_body, settings.default_max_cost_usd_per_mtok)
-    models = await catalog.list_models()
+    models = await catalog.catalog_snapshot()
     try:
         resolved = resolve_alias(
             model_or_alias,
@@ -377,6 +379,7 @@ async def route_model(model_or_alias: str, body: dict[str, Any] | None = None) -
         rolling_window_minutes=rolling_window_minutes,
         scores=scores,
         selection_reason=selection_reason,
+        catalog_models=tuple(models),
     )
 
 

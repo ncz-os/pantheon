@@ -62,6 +62,15 @@ RATE_LIMIT_TRUST_PROXY=true
 `RATE_LIMIT_TRUST_PROXY=true` is safe only when Caddy is the sole ingress and
 strips/replaces client-supplied forwarding headers.
 
+Each worker caches the static routing catalog for 15 seconds to avoid repeated
+database and JSON-cache reads. Set
+`MNEMOS_PANTHEON_CATALOG_SNAPSHOT_TTL_SECONDS=0` to retain uncached reads, or set
+a different number of seconds to tune the visibility window. The process-local
+cooldown L1 retains at most 25,000 tenant/deployment pairs by default; tune that
+ceiling with `MNEMOS_PANTHEON_COOLDOWN_L1_MAX_ENTRIES` when active tenant
+cardinality or memory limits require it. JetStream remains authoritative when
+shared state is configured.
+
 ## Install / start
 
 Install the production shared-state dependency before starting the worker pool:

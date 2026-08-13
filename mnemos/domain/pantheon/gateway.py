@@ -718,7 +718,8 @@ async def _runtime_chain(decision: RouteDecision) -> list[RouteDecision]:
     if getattr(settings, "cross_provider_fallback", False):
         from mnemos.domain.pantheon import catalog, router
 
-        built = router.build_fallback_chain(decision, await catalog.list_models())
+        models = list(decision.catalog_models) if decision.catalog_models is not None else await catalog.catalog_snapshot()
+        built = router.build_fallback_chain(decision, models)
         # only providers served by this openai-compatible path can run in the
         # chain; drop graeae-only providers (anthropic/gemini) — keep primary.
         chain = [d for d in built if _is_openai_api(d)] or [decision]

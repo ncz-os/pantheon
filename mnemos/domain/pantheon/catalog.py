@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from mnemos.domain.graeae.engine import get_graeae_engine
 
 logger = logging.getLogger(__name__)
 CATALOG_CACHE_SCHEMA = "mnemos.pantheon.catalog.v1"
+DEFAULT_SNAPSHOT_TTL_SECONDS = 15.0
 _DEFAULT_CACHE_PATHS = (
     "data/pantheon_catalog.json",
     "data/pantheon/catalog.json",
@@ -85,6 +87,41 @@ _FLEET_MODELS_BY_ID = {
     for value in (model.get("id"), model.get("model_id"), model.get("pricing_raw_model_id"))
     if str(value or "").strip()
 }
+_catalog_snapshots: dict[tuple[bool, object], tuple[float, tuple[dict[str, Any], ...]]] = {}
+
+
+def _snapshot_ttl_seconds() -> float:
+    raw = os.environ.get("MNEMOS_PANTHEON_CATALOG_SNAPSHOT_TTL_SECONDS")
+    if raw is None:
+        return DEFAULT_SNAPSHOT_TTL_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_SNAPSHOT_TTL_SECONDS
+
+
+def invalidate_catalog_snapshot() -> None:
+    """Invalidate process-local routing snapshots after an explicit refresh."""
+    _catalog_snapshots.clear()
+
+
+async def catalog_snapshot(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
+    """Return a short-lived, mutation-isolated catalog snapshot for hot paths."""
+    ttl = _snapshot_ttl_seconds()
+    if ttl <= 0:
+        return await list_models() if use_synced_cache else await list_models(use_synced_cache=False)
+    now = time.monotonic()
+    # Including the loader itself keeps replacements isolated without risking
+    # reuse of a discarded callable's numeric identity.
+    key = (use_synced_cache, list_models)
+    cached = _catalog_snapshots.get(key)
+    if cached is not None and cached[0] > now:
+        return deepcopy(list(cached[1]))
+    models = await list_models() if use_synced_cache else await list_models(use_synced_cache=False)
+    snapshot = tuple(deepcopy(models))
+    _catalog_snapshots.clear()
+    _catalog_snapshots[key] = (now + ttl, snapshot)
+    return deepcopy(list(snapshot))
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:

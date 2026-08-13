@@ -81,11 +81,24 @@ def _mgr():
 
 
 def test_manager_trips_and_marks_cooled():
-    m = _mgr()
+    store = InMemoryCooldownStore()
+    m = CooldownManager(store)
     d = m.record_failure("gpt", _err(429), NOW, is_single_deployment_group=False)
     assert d.should_cooldown is True
     assert m.is_cooled("gpt", NOW) is True
     assert m.is_cooled("gpt", NOW + DEFAULT_COOLDOWN_SECONDS + 0.1) is False  # logical-TTL expiry
+    assert store._cooled == {}  # noqa: SLF001 - expired L1 entries are reclaimed
+
+
+def test_store_bounds_cooldown_l1_with_lru_eviction():
+    store = InMemoryCooldownStore(max_entries=2)
+    store.set_cooldown("t", "old", NOW + 10)
+    store.set_cooldown("t", "hot", NOW + 10)
+    assert store.get_cooled_until("t", "old") == NOW + 10
+    store.set_cooldown("t", "new", NOW + 10)
+    assert store.get_cooled_until("t", "hot") is None
+    assert store.get_cooled_until("t", "old") == NOW + 10
+    assert store.get_cooled_until("t", "new") == NOW + 10
 
 
 def test_manager_single_group_does_not_cool():

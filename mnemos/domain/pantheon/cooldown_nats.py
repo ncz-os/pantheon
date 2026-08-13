@@ -441,6 +441,9 @@ class NatsJetStreamCooldownStore(CooldownStore):
                 raise self._unavailable("cooldown write", exc)
             logger.warning("PANTHEON NATS cooldown write failed; using explicit local fallback: %s", exc)
 
+    def discard_expired_cooldown(self, tenant: str, deployment: str, now: float) -> None:
+        self._l1.discard_expired_cooldown(tenant, deployment, now)
+
     async def aincr(self, tenant: str, deployment: str, minute: int, *, success: bool) -> None:
         try:
             counts = await asyncio.wait_for(
