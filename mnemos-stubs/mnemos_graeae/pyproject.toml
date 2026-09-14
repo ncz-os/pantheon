@@ -1,0 +1,11 @@
+[project]
+name = "mnemos-graeae"
+version = "0.1.0"
+description = "Local stub for F05 testing — mnemos-graeae is not published to PyPI as an independently installable package in this checkout; this stub exists only so uv's resolver can satisfy `mnemos-graeae>=0.1.0,<0.2` in this environment. The real `mnemos.domain.graeae` runtime is provided by the editable install of the on-disk graeae source that this project's `.venv/` already carries. The stub ships no Python package so setuptools' wheel build cannot synthesize an `mnemos/__init__.py` that would shadow the project's namespace."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = []
+
+[tool.setuptools.packages.find]
+# Explicit empty: the stub ships no Python packages.
+include = []

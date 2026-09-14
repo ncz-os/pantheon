@@ -2,6 +2,8 @@ build/
 *.egg-info/
 __pycache__/
 *.pyc
+# uv.lock is a generated artifact — not committed for the F05 fix.
+uv.lock
 # F05 dispatch artifacts: not part of the fix.
 TASK_F05.md
 zoder_run.log

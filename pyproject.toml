@@ -29,6 +29,29 @@ test = [
     "pytest-asyncio",
 ]
 
+[tool.uv.sources]
+# F05: the mnemos-* sibling packages are not published to PyPI as
+# independently installable distributions in this checkout — they ship
+# bundled with mnemos-deploy in production. To keep `uv run pytest`
+# resolvable in this multi-repo workspace we map each sibling to a
+# local stub. The mnemos-core stub lives in the sibling KNEMON
+# checkout (so both this repo and the companion F04 fix resolve
+# `mnemos-core` to the same on-disk artifact — uv refuses to resolve a
+# single transitive dep to two different URLs). The mnemos-graeae and
+# mnemos-knemon stubs live in this repo under mnemos-stubs/; mnemos-
+# knemon in particular cannot live inside its own checkout (knemon
+# depends on us transitively, so a circular editable would fail to
+# resolve). All stubs ship no Python code (`include = []` in each
+# stub's pyproject.toml) so they cannot shadow the PEP 420 namespace
+# contributions that the existing editable installs in this project's
+# `.venv/` already provide for the real `mnemos.core` /
+# `mnemos.domain.graeae` / `mnemos.domain.knemon` packages. Real
+# production nodes install these names from an internal index, where
+# these stubs are irrelevant.
+mnemos-core   = { path = "../knemon/mnemos-stubs/mnemos_core" }
+mnemos-graeae = { path = "mnemos-stubs/mnemos_graeae" }
+mnemos-knemon = { path = "mnemos-stubs/mnemos_knemon" }
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
@@ -42,4 +65,13 @@ namespaces = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["../graeae", "../knemon"]
+# Sibling-repo source roots so the PEP 420 `mnemos` namespace resolves to
+# the real `mnemos.core` / `mnemos.domain.graeae` / `mnemos.domain.knemon`
+# packages at test time. The venv's editable installs already provide
+# these; the pythonpath entries here act as a fallback in environments
+# where the venv was provisioned without them.
+pythonpath = [
+    "/Users/jasonperlow/mnemos-core-release",
+    "/Users/jasonperlow/graeae-quota-fix",
+    "/Users/jasonperlow/Projects/mnemos-fix-f04f05-budget/knemon",
+]
