@@ -324,6 +324,8 @@ def _audit_payload_for_response(
     resolved_wire_model: str | None = None,
     estimated_cost_usd: float | None = None,
     client_estimated_cost_usd: float | None = None,
+    actual_provider: str | None = None,
+    actual_model_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     payload, metadata = routing_payload(
         request_id=request_id,
@@ -345,6 +347,17 @@ def _audit_payload_for_response(
         metadata["enforced_estimated_cost_usd"] = estimated_cost_usd
     if client_estimated_cost_usd is not None:
         metadata["client_estimated_cost_usd"] = client_estimated_cost_usd
+    # Surface the actually-executed deployment identity so audit consumers can
+    # tell the difference between "the caller asked for X" and "X fell over
+    # to Y". Both the canonical form (for ledger joins) and the raw form (for
+    # human debugging) are recorded; ``actual_provider`` wins over
+    # ``decision.provider`` when set.
+    if actual_provider is not None:
+        metadata["actual_provider"] = actual_provider
+        metadata["actual_canonical_provider"] = _canonical_provider_for(actual_provider)
+    if actual_model_id is not None:
+        metadata["actual_model_id"] = actual_model_id
+        metadata["actual_canonical_model_id"] = _canonical_model_for(actual_model_id)
     return payload, metadata
 
 
@@ -359,32 +372,51 @@ def _client_estimated_cost_hint_usd(body: dict[str, Any]) -> float | None:
         return None
 
 
-def _estimate_cost_usd(decision: Any, body: dict[str, Any]) -> float:
-    pantheon = body.get("pantheon") if isinstance(body.get("pantheon"), dict) else {}
-    is_passthrough = getattr(decision, "route_type", None) == "passthrough"
-    model = decision.model or {}
-    max_tokens = (
-        body.get("max_tokens")
-        or body.get("max_completion_tokens")
-        or body.get("max_output_tokens")
-        or pantheon.get("max_tokens")
-        or pantheon.get("max_completion_tokens")
-        or pantheon.get("max_output_tokens")
-        or 0
+def _canonical_provider_for(decision: Any) -> str:
+    """Return the canonical provider key for a ``decision`` (or a raw provider string).
+
+    Funneled through ``catalog.canonical_provider`` so the admission call and
+    the ledger record use the same identity under every alias (F05 review).
+    """
+    from mnemos.domain.pantheon.catalog import canonical_provider
+
+    raw_provider = getattr(decision, "provider", None) or (
+        decision if isinstance(decision, str) else ""
     )
-    try:
-        out_tokens = max(0, int(max_tokens or 0))
-    except (TypeError, ValueError):
-        out_tokens = 0
-    if out_tokens <= 0:
-        try:
-            out_tokens = max(1, int(get_settings().pantheon.passthrough_default_estimated_output_tokens))
-        except Exception:
-            out_tokens = 4096 if is_passthrough else 1024
-    in_tokens = max(1, _approx_prompt_tokens(body))
-    in_cost = _first_pricing_float(model, "input_cost_per_mtok", "price_in", "cost_per_mtok")
-    out_cost = _first_pricing_float(model, "output_cost_per_mtok", "price_out", "cost_per_mtok")
-    return ((in_tokens * in_cost) + (out_tokens * out_cost)) / 1_000_000.0
+    return canonical_provider(raw_provider)
+
+
+def _canonical_model_for(decision: Any) -> str:
+    """Return the canonical model id for a ``decision`` (or raw id string).
+
+    Lowercased / whitespace-stripped so the ledger and admission keys line up.
+    """
+    from mnemos.domain.pantheon.catalog import canonical_model_id
+
+    raw_id = getattr(decision, "model_id", None) or (
+        decision if isinstance(decision, str) else ""
+    )
+    return canonical_model_id(raw_id)
+
+
+def _estimate_cost_usd(decision: Any, body: dict[str, Any]) -> float:
+    """Estimate the USD cost of running ``body`` against ``decision``'s deployment.
+
+    Uses the SAME shape the wire request will carry after the gateway's
+    reasoning-budget rewrite (post-rewrite ``max_*`` tokens, not the caller's
+    raw value) and folds in the response-candidate multiplicity (``n``). This
+    is a single-deployment helper; ``_check_budget_or_deny`` uses
+    ``gateway._chain_cost_estimate`` to also account for fallback candidates
+    that may actually run.
+    """
+    import mnemos.domain.pantheon.gateway as gateway_module
+
+    prompt_tokens = _approx_prompt_tokens(body)
+    return gateway_module._decision_cost_estimate(
+        body,
+        decision,
+        prompt_tokens=prompt_tokens,
+    )
 
 
 def _budget_denied_response(decision: Any) -> JSONResponse:
@@ -408,19 +440,47 @@ async def _check_budget_or_deny(
     body: dict[str, Any],
 ) -> tuple[JSONResponse | None, float, float | None]:
     import mnemos.core.lifecycle as lc
+    import mnemos.domain.pantheon.gateway as gateway_module
 
-    estimated_cost_usd = _estimate_cost_usd(decision, body)
+    # Estimate the cost against the FINAL wire shape for every deployment in
+    # the runtime chain. We can't know which one will execute at admission
+    # time, so we reserve headroom for the worst-case (most expensive)
+    # deployment — the cap is then enforced against a cost that will NOT be
+    # exceeded by any actual execution. This closes F05's token-rewrite and
+    # fallback-identity leaks: the estimate is computed against the post-
+    # rewrite token allowance and folds in any cross-provider candidate that
+    # may run if the primary fails.
+    chain = await gateway_module._runtime_chain(decision)
+    chain_cost, worst_provider = gateway_module._chain_cost_estimate(body, chain)
+    estimated_cost_usd = chain_cost if chain_cost > 0 else _estimate_cost_usd(decision, body)
     client_hint_usd = _client_estimated_cost_hint_usd(body)
+    provider_for_budget = _canonical_provider_for(
+        decision if (worst_provider is None or not worst_provider) else worst_provider
+    )
     budget_decision = await budget_module.evaluate_budget(
         backend=lc._persistence_backend,
         estimated_cost_usd=estimated_cost_usd,
         caller_subsystem="pantheon",
-        provider=decision.provider,
+        provider=provider_for_budget or None,
     )
     return (None if budget_decision.allowed else _budget_denied_response(budget_decision), estimated_cost_usd, client_hint_usd)
 
 
-async def _record_pantheon_ledger(payload: dict[str, Any], metadata: dict[str, Any], decision: Any) -> None:
+async def _record_pantheon_ledger(
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    decision: Any,
+    *,
+    actual_decision: Any | None = None,
+) -> None:
+    """Record the PANTHEON leg of the usage ledger.
+
+    ``actual_decision`` overrides ``decision`` for the ``provider``/``model``
+    fields when supplied — this is the actually-executed deployment (e.g. the
+    fallback target after a cross-provider fallover). Both the admission call
+    and this record go through ``canonical_*`` so a single physical provider
+    cannot evade its cap under either alias spelling.
+    """
     import mnemos.core.lifecycle as lc
 
     backend = lc._persistence_backend
@@ -428,12 +488,15 @@ async def _record_pantheon_ledger(payload: dict[str, Any], metadata: dict[str, A
     if recorder is None:
         return
     cost_override = None
-    if getattr(decision, "route_type", None) == "passthrough" and payload.get("cost_usd") is not None:
+    effective_decision = actual_decision if actual_decision is not None else decision
+    if getattr(effective_decision, "route_type", None) == "passthrough" and payload.get("cost_usd") is not None:
         cost_override = Decimal(str(payload["cost_usd"]))
+    canonical_provider = _canonical_provider_for(effective_decision) or "pantheon"
+    canonical_model = _canonical_model_for(effective_decision) or "pantheon"
     record = UsageLedgerRecord(
-        provider=str(decision.provider or "pantheon"),
-        model=str(decision.model_id or decision.alias),
-        task_kind=str(decision.task_type or payload.get("alias_or_model") or "pantheon"),
+        provider=canonical_provider,
+        model=canonical_model,
+        task_kind=str(getattr(effective_decision, "task_type", None) or payload.get("alias_or_model") or "pantheon"),
         tokens_in=int(payload.get("tokens_in") or 0),
         tokens_out=int(payload.get("tokens_out") or 0),
         tokens_reasoning=0,
@@ -443,7 +506,7 @@ async def _record_pantheon_ledger(payload: dict[str, Any], metadata: dict[str, A
         tier="api",
         session_id=str(metadata.get("session_id") or "") or None,
         request_count=1,
-        plan_window_id=compute_plan_window_id(str(decision.provider or "pantheon"), "api"),
+        plan_window_id=compute_plan_window_id(canonical_provider, "api"),
         path_kind="api",
         est_cost_usd=cost_override,
     )
@@ -474,6 +537,9 @@ async def _log_route_outcome(
     resolved_wire_model: str | None = None,
     estimated_cost_usd: float | None = None,
     client_estimated_cost_usd: float | None = None,
+    actual_decision: Any | None = None,
+    actual_provider: str | None = None,
+    actual_model_id: str | None = None,
 ) -> None:
     payload, metadata = _audit_payload_for_response(
         routing_payload=routing_payload,
@@ -490,9 +556,11 @@ async def _log_route_outcome(
         resolved_wire_model=resolved_wire_model,
         estimated_cost_usd=estimated_cost_usd,
         client_estimated_cost_usd=client_estimated_cost_usd,
+        actual_provider=actual_provider,
+        actual_model_id=actual_model_id,
     )
     if outcome != "budget_denied":
-        await _record_pantheon_ledger(payload, metadata, decision)
+        await _record_pantheon_ledger(payload, metadata, decision, actual_decision=actual_decision)
     schedule_routing_audit(payload, metadata)
 
 
@@ -762,6 +830,13 @@ async def _chat_completions_impl(
                         fallback_prompt_tokens=fallback_prompt_tokens,
                         completion_chars=completion_chars,
                     )
+                    # Resolve the actually-executed deployment. ``stream_chat_completion``
+                    # stashes it in a contextvar (set BEFORE iterating this generator
+                    # body) so the route handler can audit/record against the post-
+                    # fallback identity instead of the originally requested one.
+                    actual = gateway.active_stream_actual_decision() or decision
+                    actual_provider = getattr(actual, "provider", None) or decision.provider
+                    actual_model_id = getattr(actual, "model_id", None) or decision.model_id
                     try:
                         await _log_route_outcome(
                             routing_payload=routing_payload,
@@ -776,7 +851,10 @@ async def _chat_completions_impl(
                             error_class=error_class,
                             namespace=user.namespace,
                             forwarded_user=identity.opaque_user,
-                            resolved_wire_model=wire_model or decision.model_id or decision.alias,
+                            resolved_wire_model=wire_model or actual_model_id or decision.model_id or decision.alias,
+                            actual_decision=actual,
+                            actual_provider=actual_provider,
+                            actual_model_id=actual_model_id,
                         )
                     except Exception as exc:
                         logger.debug("[PANTHEON] streaming route audit failed: %s", exc)
@@ -786,6 +864,16 @@ async def _chat_completions_impl(
                 media_type="text/event-stream",
             )
         response_data = await gateway.forward_chat_completion(decision, forward_body)
+        # Surface the ACTUALLY-EXECUTED deployment (post-fallback) for both
+        # audit and ledger attribution. ``ChatCompletionResult`` is dict-shaped
+        # for legacy callers, but the canonical provider/model live on
+        # ``.provider`` / ``.model_id``. Without this, a fallback that swaps
+        # providers writes the ledger row under the original primary's identity
+        # and silently bypasses that provider's per-provider cap.
+        actual_provider = getattr(response_data, "provider", None) or decision.provider
+        actual_model_id = (
+            getattr(response_data, "model_id", None) or decision.model_id
+        )
         await _log_route_outcome_best_effort(
             routing_payload=routing_payload,
             schedule_routing_audit=schedule_routing_audit,
@@ -798,9 +886,12 @@ async def _chat_completions_impl(
             response=response_data,
             namespace=user.namespace,
             forwarded_user=identity.opaque_user,
-            resolved_wire_model=gateway.resolved_wire_model(response_data, decision),
+            resolved_wire_model=actual_model_id or gateway.resolved_wire_model(response_data, decision),
+            actual_decision=response_data,
+            actual_provider=actual_provider,
+            actual_model_id=actual_model_id,
         )
-        return JSONResponse(response_data)
+        return JSONResponse(response_data.response if hasattr(response_data, "response") else response_data)
     except PantheonRoutingError as exc:
         raise _to_http_exception(exc) from exc
     except SharedStateUnavailable as exc:
@@ -819,6 +910,7 @@ async def _chat_completions_impl(
                 error_class=exc.__class__.__name__,
                 namespace=user.namespace,
                 forwarded_user=identity.opaque_user,
+                actual_decision=gateway.active_stream_actual_decision() or decision,
             )
         raise _to_http_exception(exc) from exc
 

@@ -44,8 +44,27 @@ _routing_log_queue: asyncio.Queue[_RoutingLogItem] | None = None
 _routing_log_drainers = 0
 
 
-def _usage_value(response: dict[str, Any] | None, key: str) -> int | None:
-    usage = response.get("usage") if isinstance(response, dict) else None
+def _usage_value(response: Any, key: str) -> int | None:
+    """Extract a token count from a chat-completion response.
+
+    Accepts the raw OpenAI response dict OR a :class:`ChatCompletionResult`
+    wrapper — the F05 fix surfaces actual deployment metadata alongside the
+    response, and audit/ledger helpers must still see the wire-side token
+    counts that live on the embedded ``response`` field.
+    """
+    if response is None:
+        return None
+    # ChatCompletionResult exposes ``.response`` and a dict-compat shim; route
+    # through ``getattr`` first so the shim's ``.get`` isn't shadowed by the
+    # wrapper's own attribute.
+    usage = None
+    if hasattr(response, "response") and isinstance(getattr(response, "response"), dict):
+        usage = response.response.get("usage")
+    if usage is None and hasattr(response, "get"):
+        try:
+            usage = response.get("usage")
+        except Exception:
+            usage = None
     if not isinstance(usage, dict) or usage.get(key) is None:
         return None
     try:
@@ -64,14 +83,28 @@ def _model_cost(decision: RouteDecision, key: str) -> float | None:
     return safe_float(raw)
 
 
-def _response_cost_usd(decision: RouteDecision, response: dict[str, Any] | None) -> float | None:
+def _response_cost_usd(decision: RouteDecision, response: Any) -> float | None:
+    """Compute the realized USD cost for a chat-completion response.
+
+    Accepts the raw OpenAI response dict OR a :class:`ChatCompletionResult`
+    wrapper (F05 fix) so audit consumers can still extract cost / token info
+    from the wire response without first unwrapping the result object.
+    """
+    if response is None:
+        return None
+    inner: dict[str, Any] | None = None
     if isinstance(response, dict):
-        for key in ("cost_usd", "cost"):
-            raw = response.get(key)
-            if raw is not None:
-                return safe_float(raw)
-    tokens_in = _usage_value(response, "prompt_tokens")
-    tokens_out = _usage_value(response, "completion_tokens")
+        inner = response
+    elif hasattr(response, "response") and isinstance(getattr(response, "response"), dict):
+        inner = response.response
+    if inner is None:
+        return None
+    for key in ("cost_usd", "cost"):
+        raw = inner.get(key)
+        if raw is not None:
+            return safe_float(raw)
+    tokens_in = _usage_value(inner, "prompt_tokens")
+    tokens_out = _usage_value(inner, "completion_tokens")
     if tokens_in is None and tokens_out is None:
         return None
     input_cost = _model_cost(decision, "input_cost_per_mtok")

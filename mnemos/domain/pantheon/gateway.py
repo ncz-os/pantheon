@@ -8,6 +8,7 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -26,6 +27,15 @@ from mnemos.domain.pantheon.runtime import RouterRuntime
 
 logger = logging.getLogger(__name__)
 _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
+# Async-local context for the actually-executed deployment of the in-flight
+# streaming chat completion. ``stream_chat_completion`` writes the
+# fallback-resolved deployment here so the route handler (which owns the
+# streaming response body and audit logging) can read it back without changing
+# the iterator signature. ContextVar isolates concurrent streams across the
+# event loop.
+_ACTIVE_STREAM_ACTUAL: ContextVar[RouteDecision | None] = ContextVar(
+    "pantheon_active_stream_actual", default=None
+)
 _REASONING_MODEL_RE = re.compile(r"(reason|thinking|r1\b|\bo[134]\b|gpt-5|grok-4|deepseek)", re.I)
 _RESPONSES_MODEL_RE = re.compile(r"(?:^|/)(?:gpt-[0-9.]+.*codex|.*codex.*gpt-[0-9.]|o[134].*-codex|codex)", re.I)
 # Valid endpoint-host characters: DNS labels (alnum, dot, hyphen, underscore) and
@@ -133,10 +143,116 @@ class UpstreamIdentity:
         return f"mnemos:{digest}"
 
 
+@dataclass(frozen=True)
+class ChatCompletionResult:
+    """Wrapper around a chat-completion response that carries the ACTUAL deployment identity.
+
+    The wire response alone does not record which provider/model executed when
+    cross-provider fallback ran (F05 review): a request routed to ``claude``
+    can fall through to ``anthropic`` and the caller (and ledger) need to see
+    the fallback's identity, not the original primary's. ``provider``/``model_id``
+    here are the ones actually billed; ``response`` is the OpenAI-shaped body
+    the caller gets back.
+
+    Dict-compatibility shim: existing callers (legacy tests, the audit
+    pipeline) treat the result as if it were the response dict (e.g.
+    ``result["model"]``, ``result == {"model": "..."}``). ``__getitem__`` /
+    ``__contains__`` / ``__iter__`` / ``__eq__`` delegate to ``response`` so
+    that legacy call sites keep working without rewriting every test fixture,
+    while new code can read ``.provider`` / ``.model_id`` directly.
+    """
+
+    response: dict[str, Any]
+    provider: str
+    model_id: str | None
+
+    @property
+    def wire_model(self) -> str:
+        if isinstance(self.response, dict):
+            response_model = self.response.get("model")
+            if isinstance(response_model, str) and response_model:
+                return response_model
+        return str(self.model_id or "")
+
+    def __getitem__(self, key: str) -> Any:
+        return self.response[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.response
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(self.response)
+
+    def __len__(self) -> int:
+        return len(self.response)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.response.get(key, default)
+
+    def keys(self):  # type: ignore[no-untyped-def]
+        return self.response.keys()
+
+    def values(self):  # type: ignore[no-untyped-def]
+        return self.response.values()
+
+    def items(self):  # type: ignore[no-untyped-def]
+        return self.response.items()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ChatCompletionResult):
+            return self.response == other.response
+        if isinstance(other, dict):
+            return self.response == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.response, self.provider, self.model_id))
+
+
+@dataclass(frozen=True)
+class ChatCompletionTokenAllowance:
+    """Surface the post-rewrite token allowance for the wire request.
+
+    The reasoning-budget rewrite (F05 review) silently raises ``max_*_tokens``
+    for reasoning models, so the caller's small limit (e.g. 1) is NOT what the
+    wire request actually carries. The ledger / reservation MUST reflect the
+    post-rewrite value; this dataclass makes the rewritten value observable.
+    """
+
+    max_completion_tokens: int
+    max_output_tokens: int
+    response_candidates: int
+
+    def total_output_allowance(self) -> int:
+        # Picks whichever of the two alias fields the wire request actually used;
+        # both are usually set to the same reasoning floor, but Responses and
+        # Chat paths write to different fields, so the post-rewrite value lands
+        # in different keys.
+        primary = self.max_completion_tokens or self.max_output_tokens
+        return primary * max(1, self.response_candidates)
+
+
 def attach_upstream_identity(body: dict[str, Any], identity: UpstreamIdentity) -> dict[str, Any]:
     payload = dict(body)
     payload[_IDENTITY_BODY_KEY] = asdict(identity)
     return payload
+
+
+def active_stream_actual_decision() -> RouteDecision | None:
+    """Return the actual executed deployment for the in-flight streaming chat.
+
+    ``stream_chat_completion`` populates this contextvar when fallback resolved
+    to a non-primary deployment, so the route handler can audit/log against
+    the provider/model that ACTUALLY ran instead of the originally requested
+    one. Returns ``None`` for non-streaming or for streams where the primary
+    succeeded without fallback (caller should fall back to ``decision``).
+    """
+    return _ACTIVE_STREAM_ACTUAL.get()
+
+
+def clear_active_stream_actual() -> None:
+    """Reset the in-flight stream deployment context (test/seam helper)."""
+    _ACTIVE_STREAM_ACTUAL.set(None)
 
 
 def _pop_upstream_identity(payload: dict[str, Any]) -> UpstreamIdentity | None:
@@ -394,6 +510,62 @@ def _reasoning_budget() -> int:
     except Exception:
         configured = 8000
     return max(8000, configured)
+
+
+def _effective_max_tokens(payload: dict[str, Any], model_id: str | None) -> int:
+    """Return the max output-token allowance that the wire request will actually carry.
+
+    The reasoning-budget rewrite (see ``_apply_reasoning_budget``) silently raises
+    the caller's smaller limit to a deployment-wide floor (>=8000 for reasoning
+    models) AFTER the cost estimate has already been computed against the
+    caller's value. The two values diverge: an estimate for ``max_tokens=1`` is
+    priced for one output token, but the wire request goes out with an
+    8,000-token allowance. The ledger / reservation MUST use the post-rewrite
+    value or the cap is trivially bypassed by setting a tiny limit.
+
+    Pure/synchronous, no settings lookups, safe to call from hot paths.
+    """
+    if not model_needs_reasoning_budget(model_id):
+        raw = None
+        for field in _TOKEN_BUDGET_FIELDS:
+            if field in payload:
+                raw = payload.get(field)
+                break
+        try:
+            return max(0, int(raw)) if raw is not None else 0
+        except (TypeError, ValueError):
+            return 0
+    budget = _reasoning_budget()
+    raw = None
+    for field in _TOKEN_BUDGET_FIELDS:
+        if field in payload:
+            raw = payload.get(field)
+            break
+    try:
+        current = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        current = None
+    if current is None or current < budget:
+        return budget
+    return current
+
+
+def _candidate_multiplicity(body: dict[str, Any]) -> int:
+    """Return the response-candidate multiplicity (``n``) for a chat completion.
+
+    The OpenAI Chat Completions API supports ``n`` to request multiple independent
+    completions for the same prompt. Each candidate is billed for its own
+    completion tokens, so an estimate that ignores ``n`` underprices any call
+    that asks for more than one candidate. Defaults to 1.
+    """
+    raw = body.get("n")
+    if raw is None:
+        return 1
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 1
+    return value if value > 0 else 1
 
 
 def _apply_reasoning_budget(
@@ -670,6 +842,7 @@ class _OpenChatStream:
     decision: RouteDecision
     manager: Any
     response: httpx.Response
+    actual_decision: RouteDecision | None = None  # set by stream_chat_completion to the deployment that actually opened the stream
 
     async def aclose(self) -> None:
         await self.manager.__aexit__(None, None, None)
@@ -710,6 +883,101 @@ def _tenant_of(body: dict[str, Any]) -> str:
     if identity is None:
         return DEFAULT_TENANT
     return f"{identity.namespace}:{identity.user_id}"
+
+
+def _approx_prompt_tokens(body: dict[str, Any]) -> int:
+    """Local copy of the route-side prompt-token approximation.
+
+    Lives next to the wire-shape helpers so the chain-aware cost estimate can
+    reuse the same word-count approximation that ``_estimate_cost_usd`` does in
+    the route layer, without dragging the API route module into the gateway.
+    """
+    if isinstance(body.get("messages"), list):
+        text = " ".join(
+            str(part)
+            for message in body["messages"]
+            if isinstance(message, dict)
+            for part in (message.get("content") if isinstance(message.get("content"), list) else [message.get("content")])
+            if part is not None
+        )
+        return max(0, int((len(text) + 3) / 4))
+    if "input" in body:
+        text = " ".join(str(part) for part in (body.get("input") or []) if part is not None)
+        return max(0, int((len(text) + 3) / 4))
+    return 0
+
+
+def _first_pricing_float(model: dict[str, Any] | None, *keys: str) -> float:
+    if not isinstance(model, dict):
+        return 0.0
+    for key in keys:
+        if key not in model:
+            continue
+        try:
+            return float(model[key])
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _decision_cost_estimate(
+    body: dict[str, Any],
+    decision: RouteDecision,
+    *,
+    prompt_tokens: int | None = None,
+    n_multiplier: int | None = None,
+) -> float:
+    """Estimate USD cost of running ``body`` against ``decision``'s deployment.
+
+    The estimate uses the SAME shape the wire request will carry after the
+    gateway's ``_apply_reasoning_budget`` rewrite (i.e. the post-rewrite
+    ``max_*`` tokens, not the caller's raw value), AND folds in the
+    response-candidate multiplicity (``n``) so a single ``n=4`` request is
+    priced for 4 completions rather than 1. Returns 0.0 if the decision has no
+    resolvable pricing (passthrough / unknown model).
+    """
+    model = decision.model or {}
+    if not isinstance(model, dict):
+        return 0.0
+    in_cost = _first_pricing_float(model, "input_cost_per_mtok", "price_in", "cost_per_mtok")
+    out_cost = _first_pricing_float(model, "output_cost_per_mtok", "price_out", "cost_per_mtok")
+    if in_cost <= 0.0 and out_cost <= 0.0:
+        return 0.0
+    if prompt_tokens is None:
+        prompt_tokens = _approx_prompt_tokens(body)
+    effective_max = _effective_max_tokens(body, decision.model_id)
+    if effective_max <= 0:
+        try:
+            default_tokens = int(get_settings().pantheon.passthrough_default_estimated_output_tokens)
+        except Exception:
+            default_tokens = 4096 if getattr(decision, "route_type", None) == "passthrough" else 1024
+        effective_max = max(1, default_tokens)
+    n = n_multiplier if n_multiplier is not None else _candidate_multiplicity(body)
+    if n < 1:
+        n = 1
+    in_tokens = max(1, prompt_tokens)
+    return ((in_tokens * in_cost) + (effective_max * out_cost * n)) / 1_000_000.0
+
+
+def _chain_cost_estimate(body: dict[str, Any], chain: list[RouteDecision]) -> tuple[float, str | None]:
+    """Return (worst_case_cost_usd, canonical_provider_of_worst_case_deployment).
+
+    The estimate is the MAX across the deployments in the fallback chain — this
+    guarantees admission is charged for the worst provider/model that could
+    actually run, closing the cap-bypass where a cheap primary estimate admits
+    the request and a more expensive fallback execution overshoots the cap.
+    Returns ``(0.0, None)`` for an empty chain.
+    """
+    if not chain:
+        return 0.0, None
+    worst_cost = 0.0
+    worst_provider: str | None = None
+    for decision in chain:
+        cost = _decision_cost_estimate(body, decision)
+        if cost > worst_cost:
+            worst_cost = cost
+            worst_provider = decision.provider
+    return worst_cost, worst_provider
 
 
 async def _runtime_chain(decision: RouteDecision) -> list[RouteDecision]:
@@ -795,13 +1063,25 @@ async def _try_codex_oauth_chat_fallback(
         return None
 
 
-async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+async def forward_chat_completion(
+    decision: RouteDecision, body: dict[str, Any]
+) -> ChatCompletionResult:
     if decision.route_type == "consensus":
-        return await consensus_chat_completion(decision, body)
+        response = await consensus_chat_completion(decision, body)
+        return ChatCompletionResult(
+            response=response,
+            provider=str(decision.provider or ""),
+            model_id=decision.model_id,
+        )
 
     cfg = _provider_config(decision)
     if cfg.get("api", "openai") != "openai":
-        return await _graeae_chat_completion(decision, body)
+        response = await _graeae_chat_completion(decision, body)
+        return ChatCompletionResult(
+            response=response,
+            provider=str(decision.provider or ""),
+            model_id=decision.model_id,
+        )
 
     # Behavior-preserving resilience: route the single resolved provider through
     # the runtime so transient failures (5xx / 429 / timeout / connection) are
@@ -821,9 +1101,18 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
     except AllDeploymentsFailed as exc:
         fallback = await _try_codex_oauth_chat_fallback(decision, body, exc)
         if fallback is not None:
-            return fallback
+            return ChatCompletionResult(
+                response=fallback,
+                provider=str(decision.provider or ""),
+                model_id=decision.model_id,
+            )
         _raise_route_failure(exc)
-    return result.result
+    actual = result.deployment if getattr(result, "deployment", None) is not None else decision
+    return ChatCompletionResult(
+        response=result.result,
+        provider=str(actual.provider or decision.provider or ""),
+        model_id=actual.model_id if actual.model_id else decision.model_id,
+    )
 
 
 async def _yield_openai_chat_stream(opened: _OpenChatStream) -> AsyncIterator[bytes]:
@@ -935,27 +1224,43 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
 
     runtime = get_runtime()
     chain = await _runtime_chain(decision)
+    # Set the actual deployment context BEFORE the runtime executes so the
+    # route handler reads the fallback-resolved identity, not the primary's,
+    # in the audit/ledger path. Cleared on exit (success or failure).
+    token = _ACTIVE_STREAM_ACTUAL.set(decision)
     try:
-        result = await runtime.route(
-            chain,
-            lambda d: _open_chat_stream_once(d, body),
-            classify=classify,
-            tenant=_tenant_of(body),
-            key_of=_decision_cooldown_key,
-        )
-    except AllDeploymentsFailed as exc:
-        if _codex_oauth_route_failure_trigger(decision, exc):
-            try:
-                from mnemos.domain.pantheon import codex_oauth
+        try:
+            result = await runtime.route(
+                chain,
+                lambda d: _open_chat_stream_once(d, body),
+                classify=classify,
+                tenant=_tenant_of(body),
+                key_of=_decision_cooldown_key,
+            )
+        except AllDeploymentsFailed as exc:
+            if _codex_oauth_route_failure_trigger(decision, exc):
+                try:
+                    from mnemos.domain.pantheon import codex_oauth
 
-                async for chunk in codex_oauth.stream_chat_completion(decision, body):
-                    yield chunk
-                return
-            except Exception as fallback_exc:  # noqa: BLE001
-                logger.debug("[PANTHEON] Codex OAuth streaming fallback skipped/failed: %s", fallback_exc)
-        _raise_route_failure(exc)
-    async for chunk in _yield_openai_chat_stream(result.result):
-        yield chunk
+                    async for chunk in codex_oauth.stream_chat_completion(decision, body):
+                        yield chunk
+                    return
+                except Exception as fallback_exc:  # noqa: BLE001
+                    logger.debug("[PANTHEON] Codex OAuth streaming fallback skipped/failed: %s", fallback_exc)
+            _raise_route_failure(exc)
+        actual = result.deployment if getattr(result, "deployment", None) is not None else decision
+        _ACTIVE_STREAM_ACTUAL.set(actual)
+        try:
+            async for chunk in _yield_openai_chat_stream(result.result):
+                yield chunk
+        finally:
+            _ACTIVE_STREAM_ACTUAL.reset(token)
+    finally:
+        # Ensure we always reset, even if an exception bypasses the inner finally.
+        try:
+            _ACTIVE_STREAM_ACTUAL.reset(token)
+        except Exception:  # noqa: BLE001 - reset after reset is a no-op
+            pass
 
 
 async def _forward_embeddings_once(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:

@@ -2,3 +2,6 @@ build/
 *.egg-info/
 __pycache__/
 *.pyc
+# F05 dispatch artifacts: not part of the fix.
+TASK_F05.md
+zoder_run.log

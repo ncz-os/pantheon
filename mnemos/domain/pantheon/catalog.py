@@ -18,6 +18,59 @@ from mnemos.domain.graeae.engine import get_graeae_engine
 
 logger = logging.getLogger(__name__)
 CATALOG_CACHE_SCHEMA = "mnemos.pantheon.catalog.v1"
+
+
+def canonical_provider(provider: str | None) -> str:
+    """Return the single canonical provider identity for a PANTHEON ``provider`` string.
+
+    PANTHEON's routing layer speaks the GRAEAE provider name (e.g. ``claude`` for
+    Anthropic models); KNEMON's budget ledger is keyed on the registry provider
+    (e.g. ``anthropic``). Mixing the two on either side of an admission/ledger
+    pair lets a single physical provider evade its cap under either spelling.
+    Funneling every caller through this one helper collapses the alias pair into
+    one identity, so admission (``provider=...``) and the recorded ledger row
+    (``UsageLedgerRecord(provider=...)``) use the same key.
+
+    Precedence:
+      * known GRAEAE mapping: registry_provider wins (e.g. ``claude`` -> ``anthropic``).
+      * fleet / passthrough aliases: the configured ``passthrough_provider`` wins.
+      * otherwise: the lowercased, stripped input verbatim.
+
+    The function is total and side-effect-free; it never raises so it can be
+    called from hot paths and from logging.
+    """
+    raw = str(provider or "").strip()
+    if not raw:
+        return ""
+    lower = raw.lower()
+    mapping = GRAEAE_REGISTRY_MAP.get(lower)
+    if mapping is not None:
+        canonical = str(mapping.get("registry_provider") or "").strip().lower()
+        if canonical:
+            return canonical
+    # Fleet / passthrough aliases (codex->openai, configured passthrough_provider).
+    # A GRAEAE provider that IS the registry provider (e.g. ``openai``) maps to
+    # itself; the explicit guards below avoid the round-trip through the registry
+    # mapping (which would still produce the same answer but at extra cost).
+    if lower == "codex":
+        return "openai"
+    try:
+        configured = str(get_settings().pantheon.passthrough_provider or "").strip().lower()
+    except Exception:
+        configured = ""
+    if configured and lower == configured:
+        return configured
+    return lower
+
+
+def canonical_model_id(model_id: str | None) -> str:
+    """Return the canonical (lowercased, whitespace-stripped) form of a model id.
+
+    The wire-id is what is sent to the upstream provider; aliases are
+    PANTHEON-side and must not leak into the ledger (which would break
+    per-model accounting). The function is total and side-effect-free.
+    """
+    return str(model_id or "").strip().lower()
 DEFAULT_SNAPSHOT_TTL_SECONDS = 15.0
 _DEFAULT_CACHE_PATHS = (
     "data/pantheon_catalog.json",
