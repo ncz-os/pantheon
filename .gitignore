@@ -7,3 +7,5 @@ uv.lock
 # F05 dispatch artifacts: not part of the fix.
 TASK_F05.md
 zoder_run.log
+# PANTHEON telemetry-loss-reporting dispatch artifacts.
+TASK_TELEMETRY.md

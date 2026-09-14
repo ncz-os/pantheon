@@ -149,6 +149,11 @@ def routing_payload(
         "tokens_out": _usage_value(response, "completion_tokens"),
         "cost_usd": _response_cost_usd(decision, response),
         "error_class": error_class,
+        # PANTHEON telemetry-loss-reporting: surface the explicit degradation
+        # flag in the routing audit so observability consumers can correlate
+        # ``fallback cheapest-first`` selections with telemetry outages. Only
+        # set on ``auto:*`` aliases; ``False``/absent for other route types.
+        "adaptive_routing_degraded": decision.adaptive_routing_degraded,
     }
     metadata = {
         "schema_version": PANTHEON_ROUTING_SCHEMA_VERSION,

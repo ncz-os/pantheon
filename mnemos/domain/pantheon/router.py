@@ -25,6 +25,14 @@ class RouteDecision:
     rolling_window_minutes: int | None = None
     scores: dict[str, dict[str, Any]] | None = None
     selection_reason: str | None = None
+    # PANTHEON telemetry-loss-reporting: explicit degradation flag exposed on
+    # every ``RouteDecision`` that went through ``resolve_with_policy`` so the
+    # caller/operator can tell whether the chosen deployment came from the
+    # full adaptive policy (rolling-window telemetry + weighted score) or from
+    # the cheapest-first fallback (telemetry table empty / unreachable). This
+    # field is only meaningful for ``auto:*`` aliases; for ``single`` /
+    # ``passthrough`` decisions it stays at the default ``False``.
+    adaptive_routing_degraded: bool = False
     catalog_models: tuple[dict[str, Any], ...] | None = field(default=None, repr=False, compare=False)
 
     def explain(self) -> dict[str, Any]:
@@ -41,6 +49,12 @@ class RouteDecision:
             "scores": self.scores or {},
             "selected": self.model_id,
             "selection_reason": selection_reason,
+            # PANTHEON telemetry-loss-reporting: surface the degradation flag
+            # in the explain payload so audit/observability consumers see the
+            # same flag the route decision carries. ``False`` for non-auto
+            # route types; ``True`` when the adaptive policy fell back to
+            # cheapest-first because telemetry was unavailable.
+            "adaptive_routing_degraded": self.adaptive_routing_degraded,
             "resolution_chain": [
                 {"step": "input", "value": self.alias},
                 {
@@ -348,6 +362,7 @@ async def route_model(model_or_alias: str, body: dict[str, Any] | None = None) -
     scores: dict[str, dict[str, Any]] | None = None
     selection_reason: str | None = None
     rolling_window_minutes: int | None = None
+    adaptive_routing_degraded: bool = False
     if resolved["type"] == "auto":
         rolling_window_minutes = settings.routing_window_minutes
         policy_route = await resolve_with_policy(
@@ -367,6 +382,16 @@ async def route_model(model_or_alias: str, body: dict[str, Any] | None = None) -
         candidates = policy_route.candidates
         scores = policy_route.scores
         selection_reason = policy_route.selection_reason
+        # PANTHEON telemetry-loss-reporting: forward the explicit degradation
+        # flag from the policy layer onto the route decision. Non-auto
+        # routes (``single`` / ``passthrough`` / ``consensus``) leave it at
+        # the default ``False`` because the rolling-window policy never ran.
+        # Use ``getattr`` with a default so older test mocks that build a
+        # ``SimpleNamespace`` without the new field don't break — those
+        # mocks don't simulate degradation anyway.
+        adaptive_routing_degraded = bool(
+            getattr(policy_route, "adaptive_routing_degraded", False)
+        )
     return RouteDecision(
         alias=resolved["alias"],
         provider=resolved["provider"],
@@ -379,6 +404,7 @@ async def route_model(model_or_alias: str, body: dict[str, Any] | None = None) -
         rolling_window_minutes=rolling_window_minutes,
         scores=scores,
         selection_reason=selection_reason,
+        adaptive_routing_degraded=adaptive_routing_degraded,
         catalog_models=tuple(models),
     )
 

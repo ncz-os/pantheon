@@ -20,6 +20,17 @@ dependencies = [
     "gunicorn",
     "httpx",
     "uvicorn",
+    # PANTHEON telemetry-loss-reporting: the local mnemos-core stub ships no
+    # Python code (the real `mnemos.core` runtime is resolved from the
+    # sibling mnemos-core checkout via the pytest `pythonpath`), so the
+    # transitive runtime deps that the real `mnemos-core` would normally
+    # pull in (pydantic-settings, asyncpg, python-dotenv) need to be
+    # declared here for the `uv run pytest` validator to find them in a
+    # fresh venv. Without these the preflight `from mnemos.api.main import
+    # app` in `tests/conftest.py::pytest_sessionstart` crashes at
+    # collection time with `ModuleNotFoundError: No module named
+    # 'pydantic_settings'` before any test of interest runs.
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -30,25 +41,22 @@ test = [
 ]
 
 [tool.uv.sources]
-# F05: the mnemos-* sibling packages are not published to PyPI as
-# independently installable distributions in this checkout — they ship
-# bundled with mnemos-deploy in production. To keep `uv run pytest`
-# resolvable in this multi-repo workspace we map each sibling to a
-# local stub. The mnemos-core stub lives in the sibling KNEMON
-# checkout (so both this repo and the companion F04 fix resolve
-# `mnemos-core` to the same on-disk artifact — uv refuses to resolve a
-# single transitive dep to two different URLs). The mnemos-graeae and
-# mnemos-knemon stubs live in this repo under mnemos-stubs/; mnemos-
-# knemon in particular cannot live inside its own checkout (knemon
-# depends on us transitively, so a circular editable would fail to
-# resolve). All stubs ship no Python code (`include = []` in each
-# stub's pyproject.toml) so they cannot shadow the PEP 420 namespace
-# contributions that the existing editable installs in this project's
-# `.venv/` already provide for the real `mnemos.core` /
-# `mnemos.domain.graeae` / `mnemos.domain.knemon` packages. Real
-# production nodes install these names from an internal index, where
-# these stubs are irrelevant.
-mnemos-core   = { path = "../knemon/mnemos-stubs/mnemos_core" }
+# PANTHEON telemetry-loss-reporting fix: the mnemos-* sibling packages are
+# not published to PyPI as independently installable distributions in this
+# checkout — they ship bundled with mnemos-deploy in production. To keep
+# `uv run pytest` resolvable in this multi-repo workspace we map each
+# sibling to a local stub. All three stubs ship no Python code
+# (`include = []` in each stub's pyproject.toml) so they cannot shadow the
+# PEP 420 namespace contributions that the existing editable installs in
+# this project's `.venv/` already provide for the real `mnemos.core` /
+# `mnemos.domain.graeae` / `mnemos.domain.knemon` packages. The earlier
+# F05 attempt to share mnemos-core with the sibling KNEMON checkout via
+# `../knemon/mnemos-stubs/mnemos_core` broke once that sibling checkout
+# was moved (uv refuses to resolve a single transitive dep to a missing
+# URL). The PANTHEON telemetry-loss-reporting fix bundles the core stub
+# inside this repo so the validator is independent of sibling-checkout
+# layout.
+mnemos-core   = { path = "mnemos-stubs/mnemos_core" }
 mnemos-graeae = { path = "mnemos-stubs/mnemos_graeae" }
 mnemos-knemon = { path = "mnemos-stubs/mnemos_knemon" }
 
@@ -66,12 +74,42 @@ namespaces = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Sibling-repo source roots so the PEP 420 `mnemos` namespace resolves to
-# the real `mnemos.core` / `mnemos.domain.graeae` / `mnemos.domain.knemon`
-# packages at test time. The venv's editable installs already provide
-# these; the pythonpath entries here act as a fallback in environments
-# where the venv was provisioned without them.
+# the real `mnemos.core` / `mnemos.domain.graeae` packages at test time.
+# The venv's editable installs already provide these; the pythonpath
+# entries here act as a fallback in environments where the venv was
+# provisioned without them. The earlier F05 fix also pointed at
+# `/Users/jasonperlow/Projects/mnemos-fix-f04f05-budget/knemon` for the
+# `mnemos.domain.knemon` package, but that sibling checkout has since
+# been removed from the workspace — referencing it here made the
+# validator crash at startup with "No such file or directory" instead
+# of pytest failing on the test of interest. The PANTHEON
+# telemetry-loss-reporting fix removes the dead knemon entry; tests
+# that genuinely need `mnemos.domain.knemon` ship their own runtime
+# stub via `tests/_knemon_stubs.py` (see `conftest.py`).
 pythonpath = [
     "/Users/jasonperlow/mnemos-core-release",
     "/Users/jasonperlow/graeae-quota-fix",
-    "/Users/jasonperlow/Projects/mnemos-fix-f04f05-budget/knemon",
+]
+
+[dependency-groups]
+dev = [
+    "aiosqlite>=0.22.1",
+    "asyncpg>=0.31.0",
+    "authlib>=1.8.0",
+    "cryptography>=50.0.1",
+    "itsdangerous>=2.2.0",
+    "limits>=5.8.0",
+    "mcp>=2.2.0",
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "opentelemetry-sdk>=1.44.0",
+    "prometheus-client>=0.26.0",
+    "pydantic-settings>=2.15.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "python-multipart>=0.0.32",
+    "slowapi>=0.1.10",
+    "starlette>=1.6.0",
+    "structlog>=26.1.0",
+    "typer>=0.27.2",
 ]

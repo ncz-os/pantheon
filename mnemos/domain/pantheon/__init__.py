@@ -15,14 +15,20 @@ from mnemos.domain.pantheon.fleet_compat import install_core_graeae_compat
 install_core_graeae_compat()
 
 from mnemos.domain.pantheon.catalog import list_models, models_response
+from mnemos.domain.pantheon.policy import (
+    is_adaptive_routing_degraded,
+    reset_degradation_flag_for_tests,
+)
 from mnemos.domain.pantheon.router import RouteDecision, explain_route, route_model
 from mnemos.domain.pantheon.triage import recommend
 
 __all__ = [
     "RouteDecision",
     "explain_route",
+    "is_adaptive_routing_degraded",
     "list_models",
     "models_response",
     "recommend",
+    "reset_degradation_flag_for_tests",
     "route_model",
 ]
