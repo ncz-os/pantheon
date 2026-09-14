@@ -10,7 +10,7 @@ def test_fleet_dependencies_are_bounded_to_supported_release_lines() -> None:
     )
     dependencies = set(pyproject["project"]["dependencies"])
 
-    assert "mnemos-core>=6.1,<6.2" in dependencies
+    assert "mnemos-core>=6.2,<7" in dependencies
     assert "mnemos-graeae>=0.1.0,<0.2" in dependencies
 
 

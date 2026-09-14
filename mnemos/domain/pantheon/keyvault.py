@@ -34,7 +34,6 @@ _DEFAULT_ENV_MAP: dict[str, str] = {
     "nvidia": "NVIDIA_API_KEY",
     "ngc": "NVIDIA_API_KEY",
     "eih": "EIH_API_KEY",
-    "openai": "OPENAI_API_KEY",
 }
 
 
