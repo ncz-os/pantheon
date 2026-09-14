@@ -842,3 +842,157 @@ def test_route_layer_records_post_rewrite_token_allowance(monkeypatch):
         "both must be priced against the post-rewrite 8000-token allowance, "
         "not the caller's 1-token raw value."
     )
+
+
+# ── Cross-cutting: runtime chain + alias both collapse correctly ─────────
+
+
+def test_check_budget_canonicalizes_worst_case_provider_in_chain(monkeypatch):
+    """The budget call uses the canonical key for the WORST chain deployment.
+
+    F05's most insidious path: a cheap primary (alias ``claude``) admits cheaply,
+    but its fallback (canonical ``anthropic``) is more expensive AND carries the
+    cap that the operator configured. Both admission and the eventual ledger row
+    must speak the canonical key so the per-provider cap catches the request.
+
+    Reproduces the chain-aware alias bypass the F05 review flagged.
+    """
+    from mnemos.api.routes import pantheon as pantheon_routes
+    from mnemos.domain.pantheon import catalog, gateway, router
+
+    def _settings():
+        return SimpleNamespace(
+            pantheon=SimpleNamespace(
+                default_quality_floor=0.0,
+                default_max_cost_usd_per_mtok=None,
+                routing_window_minutes=15,
+                passthrough_enabled=True,
+                passthrough_provider="claude",
+                passthrough_default_input_cost_per_mtok=5.0,
+                passthrough_default_output_cost_per_mtok=30.0,
+                passthrough_default_estimated_output_tokens=4096,
+                cross_provider_fallback=True,  # ENABLE so the chain has both
+                upstream_timeout_seconds=60.0,
+                reasoning_output_token_budget=8000,
+            )
+        )
+
+    monkeypatch.setattr(router, "get_settings", _settings)
+    monkeypatch.setattr(gateway, "get_settings", _settings)
+
+    # Primary: alias ``claude`` (cheap); fallback: canonical ``anthropic``
+    # (expensive — the one with the configured cap).
+    primary_decision = SimpleNamespace(
+        alias="claude-opus",
+        provider="claude",  # alias
+        model_id="claude-opus-4",
+        route_type="literal",
+        reason="primary",
+        model={
+            "id": "claude-opus-4",
+            "provider": "claude",
+            "registry_provider": "anthropic",
+            "input_cost_per_mtok": 5.0,
+            "output_cost_per_mtok": 25.0,
+            "capabilities": ["chat"],
+        },
+        catalog_models=None,
+        candidates=["claude-opus-4", "anthropic/claude-opus-4"],
+    )
+
+    # Stub the catalog snapshot to a single fallback deployment so the runtime
+    # chain contains [primary, fallback]. The fallback uses the registry key.
+    fallback_model = {
+        "id": "claude-opus-4-fb",
+        "provider": "anthropic",
+        "registry_provider": "anthropic",
+        "input_cost_per_mtok": 5.0,
+        "output_cost_per_mtok": 100.0,  # 4x primary — must dominate the estimate
+        "capabilities": ["chat"],
+    }
+    # ``catalog`` is imported lazily inside ``_runtime_chain``; patch the source
+    # module's binding so the lazy import resolves to our stub.
+    import mnemos.domain.pantheon.catalog as catalog_module
+
+    async def _fake_catalog_snapshot(**_kwargs):
+        return [fallback_model]
+
+    monkeypatch.setattr(
+        catalog_module, "catalog_snapshot", _fake_catalog_snapshot
+    )
+    # Mark the fallback as openai-API so the chain isn't trimmed by the
+    # _is_openai_api guard inside _runtime_chain.
+    monkeypatch.setattr(gateway, "_is_openai_api", lambda d: True)
+
+    # The fallback deployment the chain should include after the primary.
+    fallback_decision = SimpleNamespace(
+        alias="claude-opus-4-fb",
+        provider="anthropic",
+        model_id="claude-opus-4-fb",
+        route_type="literal",
+        reason="fallback-candidate",
+        model=fallback_model,
+        catalog_models=None,
+    )
+
+    def _build_chain(primary_decision, _models):
+        return [primary_decision, fallback_decision]
+
+    monkeypatch.setattr(router, "build_fallback_chain", _build_chain)
+
+    budget_calls: list[dict] = []
+
+    class _Budget:
+        async def evaluate_budget(self, **kwargs):
+            budget_calls.append(kwargs)
+            return SimpleNamespace(allowed=True, verdict="allow")
+
+    response, estimated_cost, _ = asyncio.run(
+        pantheon_routes._check_budget_or_deny(
+            _Budget(),
+            primary_decision,
+            {"messages": [{"role": "user", "content": "hi"}]},
+        )
+    )
+    assert response is None
+    assert budget_calls, "budget was not consulted"
+    # The worst-case deployment was ``anthropic`` (canonical); admission must
+    # use that canonical key so KNEMON's per-provider cap is checked against
+    # the right identity. If the alias ``claude`` were used here, the cap set
+    # under ``anthropic`` would silently miss the row.
+    assert budget_calls[0]["provider"] == "anthropic", (
+        f"F05 chain+alias bypass: budget was consulted with provider="
+        f"{budget_calls[0]['provider']!r}; the worst-case deployment in the "
+        "chain was 'anthropic' (canonical) — admission must use the canonical "
+        "key so the per-provider cap configured under 'anthropic' catches this "
+        "request even though the primary was routed under the 'claude' alias."
+    )
+    # Sanity: the chain-aware estimate must dominate the primary-only estimate.
+    primary_only_cost = _decision_cost_estimate(
+        {"messages": [{"role": "user", "content": "hi"}]}, primary_decision, prompt_tokens=10
+    )
+    assert estimated_cost > primary_only_cost, (
+        "F05 chain+alias bypass: worst-case chain estimate must dominate the "
+        "primary-only estimate so the cap is enforced against what could actually run."
+    )
+
+
+def test_clear_active_stream_actual_after_explicit_reset(monkeypatch):
+    """``clear_active_stream_actual`` is idempotent and survives outer resets.
+
+    Pins the contract that the streaming contextvar cleanup never leaves a
+    stale fallback deployment lingering for the next request on the same task.
+    """
+    # Use the same contextvar stream_chat_completion uses internally so the
+    # test exercises the real cleanup path rather than a parallel helper.
+    from mnemos.domain.pantheon.gateway import _ACTIVE_STREAM_ACTUAL
+
+    token = _ACTIVE_STREAM_ACTUAL.set(_primary_decision())
+    assert gateway.active_stream_actual_decision() == _primary_decision()
+    _ACTIVE_STREAM_ACTUAL.reset(token)
+    assert gateway.active_stream_actual_decision() is None
+    gateway.clear_active_stream_actual()
+    assert gateway.active_stream_actual_decision() is None
+    # Re-clear is a no-op.
+    gateway.clear_active_stream_actual()
+    assert gateway.active_stream_actual_decision() is None
