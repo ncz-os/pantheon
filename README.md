@@ -85,3 +85,29 @@ supported by our open-source infrastructure partners:
   [Buildkite Open Source](https://buildkite.com/pricing) program.
 
 Thank you to both for backing open-source software.
+
+
+## Provider attempt accounting
+
+Python 3.13 or newer is required, matching core. Development installs resolve
+real sibling checkouts `../mnemos-core`, `../graeae`, and `../knemon`; runtime
+packages are not replaced with test stubs.
+
+The route-level budget check is advisory. Each actual HTTP retry/fallback,
+embedding request, and opened stream atomically reserves KNEMON headroom for
+its own provider and final bounded token allowance before upstream work.
+Missing pricing or persistence fails closed under configured monetary caps.
+Absent chat limits receive a 4096-token bound (reasoning models keep their
+configured reasoning floor). UTF-8 request size conservatively estimates text
+input; token usage determines settlement when present. Missing usage and
+ambiguous failures retain the estimate. Subscription OAuth attempts are
+recorded as `codex-oauth` with their actual reconciled model and zero marginal
+API price; this is not a subscription-utilization quota guarantee.
+
+Streaming usage and identity travel with the opened attempt and explicit
+request state. Finalization runs on completion, cancellation, and error-body
+read/close failures. The route records audit metadata; the attempt owns the
+usage ledger, preventing duplicate rows. Requests delegated to GRAEAE are
+accounted once in its `graeae` budget scope. Other PANTHEON attempts use the
+`pantheon` scope. See KNEMON's README for recovery and rolling-window scaling
+limits.

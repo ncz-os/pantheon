@@ -9,7 +9,6 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-
 from mnemos.api.dependencies import UserContext, get_current_user
 
 
@@ -110,12 +109,19 @@ class _PolicyConnection:
 
         out = []
         for backend, items in grouped.items():
-            out.append({
-                "backend": backend,
-                "avg_latency_ms": sum(float(item["latency_ms"]) for item in items) / len(items),
-                "error_rate": sum(1 for item in items if item.get("outcome") == "error") / len(items),
-                "avg_cost": sum(float(item["cost_usd"]) for item in items) / len(items),
-            })
+            out.append(
+                {
+                    "backend": backend,
+                    "avg_latency_ms": sum(float(item["latency_ms"]) for item in items)
+                    / len(items),
+                    "error_rate": sum(
+                        1 for item in items if item.get("outcome") == "error"
+                    )
+                    / len(items),
+                    "avg_cost": sum(float(item["cost_usd"]) for item in items)
+                    / len(items),
+                }
+            )
         return out
 
 
@@ -127,7 +133,9 @@ class _PolicyPool:
         return _AcquireContext(self.conn)
 
 
-def _routing_rows(*, backend: str, count: int, latency_ms: float, cost_usd: float = 0.01) -> list[dict[str, Any]]:
+def _routing_rows(
+    *, backend: str, count: int, latency_ms: float, cost_usd: float = 0.01
+) -> list[dict[str, Any]]:
     now = datetime.now(timezone.utc)
     return [
         {
@@ -153,7 +161,8 @@ async def _drain_background_tasks() -> None:
 
 def _routing_memories(db_pool) -> list[dict[str, Any]]:
     return [
-        memory for memory in db_pool.state["memories"].values()
+        memory
+        for memory in db_pool.state["memories"].values()
         if memory.get("category") == "pantheon_routing"
     ]
 
@@ -164,12 +173,13 @@ def _routing_audits(db_pool) -> list[dict[str, Any]]:
 
 @pytest_asyncio.fixture
 async def pantheon_v02_client(monkeypatch, db_pool):
-    from mnemos.api.main import app
-    from mnemos.core.config import _reset_settings_for_tests
     import mnemos.core.lifecycle as lc
     import mnemos.domain.pantheon.catalog as pantheon_catalog
     import mnemos.domain.pantheon.gateway as pantheon_gateway
+    from mnemos.api.main import app
+    from mnemos.core.config import _reset_settings_for_tests
     from mnemos.domain.pantheon.caps import consultation_cap_bucket
+
     from tests._fake_backend import FakePoolBackedBackend
 
     monkeypatch.setenv("MNEMOS_PANTHEON_ENABLED", "true")
@@ -208,7 +218,9 @@ async def pantheon_v02_client(monkeypatch, db_pool):
     app.dependency_overrides[get_current_user] = lambda: _user()
     transport = ASGITransport(app=app)
     try:
-        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        async with AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
             yield client, db_pool
     finally:
         await _drain_background_tasks()
@@ -229,10 +241,14 @@ async def test_agentic_cap_blocks_fifty_first_same_session(pantheon_v02_client):
     body = {"model": "claude-consult", "messages": [{"role": "user", "content": "hi"}]}
 
     for _ in range(50):
-        response = await client.post("/pantheon/v1/chat/completions", json=body, headers=headers)
+        response = await client.post(
+            "/pantheon/v1/chat/completions", json=body, headers=headers
+        )
         assert response.status_code == 200
 
-    blocked = await client.post("/pantheon/v1/chat/completions", json=body, headers=headers)
+    blocked = await client.post(
+        "/pantheon/v1/chat/completions", json=body, headers=headers
+    )
 
     assert blocked.status_code == 429
     error = blocked.json()["error"]
@@ -244,7 +260,9 @@ async def test_agentic_cap_blocks_fifty_first_same_session(pantheon_v02_client):
 
 
 @pytest.mark.asyncio
-async def test_agentic_cap_cannot_be_reset_by_client_session_header(pantheon_v02_client):
+async def test_agentic_cap_cannot_be_reset_by_client_session_header(
+    pantheon_v02_client,
+):
     client, _db_pool = pantheon_v02_client
     body = {"model": "claude-consult", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -272,7 +290,9 @@ async def test_agentic_cap_cannot_be_reset_by_client_session_header(pantheon_v02
 
 
 @pytest.mark.asyncio
-async def test_routing_log_success_writes_pantheon_audit_not_memory(pantheon_v02_client):
+async def test_routing_log_success_writes_pantheon_audit_not_memory(
+    pantheon_v02_client,
+):
     client, db_pool = pantheon_v02_client
 
     response = await client.post(
@@ -296,7 +316,9 @@ async def test_routing_log_success_writes_pantheon_audit_not_memory(pantheon_v02
     assert payload["metadata"]["pantheon_version"] == "0.2"
     assert payload["metadata"]["session_id"] == "log-success"
     assert payload["metadata"]["usage_tier"] == "agentic_ok"
-    assert db_pool.state["usage_ledger"][-1]["caller_subsystem"] == "pantheon"
+    assert (
+        db_pool.state["usage_ledger"] == []
+    )  # fake gateway performed no billable attempt
 
 
 @pytest.mark.asyncio
@@ -379,11 +401,13 @@ async def test_routing_audit_marks_successful_direct_write_for_every_pipeline_fl
     writes = []
     publishes = []
     settings = SimpleNamespace(
-        pantheon=SimpleNamespace(routing_log_queue_size=10, routing_log_drain_workers=1),
+        pantheon=SimpleNamespace(
+            routing_log_queue_size=10, routing_log_drain_workers=1
+        ),
         nats=SimpleNamespace(
             publish_pantheon_routing=publish_enabled,
             audit_consumer_enabled=consumer_enabled,
-        )
+        ),
     )
 
     async def _write(payload, metadata):
@@ -483,7 +507,9 @@ async def test_audit_consumer_recovers_event_when_direct_write_failed():
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_schedules_pantheon_audit_consumer_for_non_pg_backend(monkeypatch):
+async def test_lifecycle_schedules_pantheon_audit_consumer_for_non_pg_backend(
+    monkeypatch,
+):
     from mnemos.api import lifecycle_hooks
     from mnemos.core import lifecycle
     from mnemos.core.config import _reset_settings_for_tests, get_settings
@@ -514,7 +540,9 @@ async def test_lifecycle_schedules_pantheon_audit_consumer_for_non_pg_backend(mo
     monkeypatch.setattr(
         lifecycle,
         "_post_db_startup_hooks",
-        {"PANTHEON routing audit NATS consumer": lifecycle_hooks._pantheon_routing_audit_post_db_hook},
+        {
+            "PANTHEON routing audit NATS consumer": lifecycle_hooks._pantheon_routing_audit_post_db_hook
+        },
     )
     try:
         await lifecycle._run_post_db_startup_hooks(backend, settings)
@@ -588,17 +616,29 @@ async def test_audit_consumer_idle_timeout_keeps_healthy_subscription() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pantheon_budget_denies_when_knemon_over_cap(monkeypatch, pantheon_v02_client):
+async def test_pantheon_budget_denies_when_knemon_over_cap(
+    monkeypatch, pantheon_v02_client
+):
     from mnemos.core.config import _reset_settings_for_tests
 
     client, db_pool = pantheon_v02_client
-    db_pool.state["usage_ledger"].append({"caller_subsystem": "pantheon", "est_cost_usd": 201})
+    db_pool.state["usage_ledger"].append(
+        {"caller_subsystem": "pantheon", "est_cost_usd": 201}
+    )
     monkeypatch.setenv("MNEMOS_KNEMON_WEEKLY_BUDGET_CAP_USD", "200")
     _reset_settings_for_tests()
+
+    async def actual_spend(backend, **kwargs):
+        return sum(float(row["est_cost_usd"]) for row in db_pool.state["usage_ledger"])
+
+    monkeypatch.setattr("mnemos.domain.knemon.budget.effective_spend_usd", actual_spend)
     try:
         response = await client.post(
             "/pantheon/v1/chat/completions",
-            json={"model": "cheap-chat", "messages": [{"role": "user", "content": "hi"}]},
+            json={
+                "model": "cheap-chat",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
             headers={"X-Pantheon-Session": "over-budget"},
         )
     finally:
@@ -661,7 +701,10 @@ async def test_rolling_window_policy_picks_best_scoring_backend():
     )
 
     assert route.selected["id"] == "backend_a"
-    assert route.scores["backend_a"]["weighted_score"] < route.scores["backend_b"]["weighted_score"]
+    assert (
+        route.scores["backend_a"]["weighted_score"]
+        < route.scores["backend_b"]["weighted_score"]
+    )
     assert route.selection_reason == "best weighted score (latency+error+cost)"
 
 
@@ -680,11 +723,16 @@ async def test_empty_rolling_window_falls_back_to_cheapest_first():
 
     assert route.selected["id"] == "cheap"
     assert route.telemetry_available is False
-    assert route.selection_reason == "fallback cheapest-first policy (no rolling telemetry)"
+    assert (
+        route.selection_reason
+        == "fallback cheapest-first policy (no rolling telemetry)"
+    )
 
 
 @pytest.mark.asyncio
-async def test_route_explain_returns_scores_and_selection_reason(monkeypatch, pantheon_v02_client):
+async def test_route_explain_returns_scores_and_selection_reason(
+    monkeypatch, pantheon_v02_client
+):
     import mnemos.core.lifecycle as lc
 
     client, _db_pool = pantheon_v02_client

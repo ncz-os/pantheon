@@ -2,28 +2,36 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-
 from mnemos.core.config import get_settings
-from mnemos.domain.providers import get_key, get_provider_config
 from mnemos.domain.graeae.engine import get_graeae_engine
-from mnemos.domain.openai_compat.content import _content_text, _flatten_messages_for_prompt
-from mnemos.domain.pantheon.router import RouteDecision
-from mnemos.domain.pantheon.cooldown import DEFAULT_TENANT, CooldownManager, InMemoryCooldownStore
+from mnemos.domain.openai_compat.content import (
+    _content_text,
+    _flatten_messages_for_prompt,
+)
+from mnemos.domain.pantheon.accounting import accounted, begin_attempt
+from mnemos.domain.pantheon.cooldown import (
+    DEFAULT_TENANT,
+    CooldownManager,
+    InMemoryCooldownStore,
+)
 from mnemos.domain.pantheon.fallback import AllDeploymentsFailed
 from mnemos.domain.pantheon.http_bridge import classify, retry_after_seconds
+from mnemos.domain.pantheon.router import RouteDecision
 from mnemos.domain.pantheon.runtime import RouterRuntime
+from mnemos.domain.providers import get_key, get_provider_config
 
 logger = logging.getLogger(__name__)
 _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
@@ -36,8 +44,12 @@ _IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
 _ACTIVE_STREAM_ACTUAL: ContextVar[RouteDecision | None] = ContextVar(
     "pantheon_active_stream_actual", default=None
 )
-_REASONING_MODEL_RE = re.compile(r"(reason|thinking|r1\b|\bo[134]\b|gpt-5|grok-4|deepseek)", re.I)
-_RESPONSES_MODEL_RE = re.compile(r"(?:^|/)(?:gpt-[0-9.]+.*codex|.*codex.*gpt-[0-9.]|o[134].*-codex|codex)", re.I)
+_REASONING_MODEL_RE = re.compile(
+    r"(reason|thinking|r1\b|\bo[134]\b|gpt-5|grok-4|deepseek)", re.I
+)
+_RESPONSES_MODEL_RE = re.compile(
+    r"(?:^|/)(?:gpt-[0-9.]+.*codex|.*codex.*gpt-[0-9.]|o[134].*-codex|codex)", re.I
+)
 # Valid endpoint-host characters: DNS labels (alnum, dot, hyphen, underscore) and
 # IPv4 / IPv6-literal characters (urlparse strips IPv6 brackets, leaving colons).
 # Rejects malformed hosts like "%zz" that urlparse/httpx tolerate.
@@ -58,8 +70,17 @@ _PANTHEON_PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
     "nvidia": {"api": "openai", "key_name": "nvidia", "enabled": True},
     "eih": {"api": "openai", "key_name": "eih", "enabled": True},
     "ngc": {"api": "openai", "key_name": "ngc", "enabled": True},
-    "deepseek-direct": {"api": "openai", "key_name": "deepseek-direct", "enabled": True},
-    "codex-oauth": {"api": "openai", "key_name": "codex-oauth", "enabled": False, "fallback_only": True},
+    "deepseek-direct": {
+        "api": "openai",
+        "key_name": "deepseek-direct",
+        "enabled": True,
+    },
+    "codex-oauth": {
+        "api": "openai",
+        "key_name": "codex-oauth",
+        "enabled": False,
+        "fallback_only": True,
+    },
 }
 _CODEX_OAUTH_FALLBACK_PROVIDERS = {"eih", "ngc", "nvidia"}
 _CODEX_OAUTH_FALLBACK_STATUSES = {502, 503, 504}
@@ -232,7 +253,9 @@ class ChatCompletionTokenAllowance:
         return primary * max(1, self.response_candidates)
 
 
-def attach_upstream_identity(body: dict[str, Any], identity: UpstreamIdentity) -> dict[str, Any]:
+def attach_upstream_identity(
+    body: dict[str, Any], identity: UpstreamIdentity
+) -> dict[str, Any]:
     payload = dict(body)
     payload[_IDENTITY_BODY_KEY] = asdict(identity)
     return payload
@@ -345,17 +368,29 @@ def _provider_config(decision: RouteDecision) -> dict[str, Any]:
     # Forward-compatible: a no-op until graeae tags fallback providers
     # `_source="builtin"`.
     if str(provider_cfg.get("_source") or "").strip().lower() == "builtin":
-        for _endpoint_field in ("base_url", "url", "chat_url", "responses_url", "embeddings_url"):
+        for _endpoint_field in (
+            "base_url",
+            "url",
+            "chat_url",
+            "responses_url",
+            "embeddings_url",
+        ):
             provider_cfg.pop(_endpoint_field, None)
     try:
-        operator_cfg = {k: v for k, v in get_provider_config(decision.provider).items() if k != "api_key"}
+        operator_cfg = {
+            k: v
+            for k, v in get_provider_config(decision.provider).items()
+            if k != "api_key"
+        }
     except Exception:
         operator_cfg = {}
     cfg = {**defaults, **provider_cfg, **operator_cfg}
     if not cfg:
         # An unregistered provider is a local deployment-config fault: terminal and
         # non-fallbackable (config_error), consistent with the no-endpoint guard.
-        raise PantheonGatewayError(503, f"provider {decision.provider!r} is not registered", config_error=True)
+        raise PantheonGatewayError(
+            503, f"provider {decision.provider!r} is not registered", config_error=True
+        )
     base_url = _valid_endpoint(cfg.get("base_url"))
     if base_url:
         normalized = _base_v1_url(base_url)
@@ -384,14 +419,18 @@ def _provider_config(decision: RouteDecision) -> dict[str, Any]:
         or _valid_endpoint(cfg.get("embeddings_url"), allow_query=True)
     ):
         raise PantheonGatewayError(
-            503, f"provider {decision.provider!r} has no endpoint configured", config_error=True
+            503,
+            f"provider {decision.provider!r} has no endpoint configured",
+            config_error=True,
         )
     if decision.model_id:
         cfg["model"] = decision.model_id
     return cfg
 
 
-def _auth_headers(cfg: dict[str, Any], identity: UpstreamIdentity | None = None) -> dict[str, str]:
+def _auth_headers(
+    cfg: dict[str, Any], identity: UpstreamIdentity | None = None
+) -> dict[str, str]:
     key_name = cfg.get("key_name")
     api_key = get_key(str(key_name or ""))
     if not api_key:
@@ -399,7 +438,9 @@ def _auth_headers(cfg: dict[str, Any], identity: UpstreamIdentity | None = None)
         # outage: fail closed (terminal, non-fallbackable) rather than laundering
         # it into a Codex-OAuth fallback for eih/ngc/nvidia.
         raise PantheonGatewayError(
-            503, f"missing api_key for provider key_name={key_name!r}", config_error=True
+            503,
+            f"missing api_key for provider key_name={key_name!r}",
+            config_error=True,
         )
     return {
         "Authorization": f"Bearer {api_key}",
@@ -423,7 +464,9 @@ def _upstream_timeout(cfg: dict[str, Any]) -> float:
     return timeout if timeout > 0.0 else DEFAULT_UPSTREAM_TIMEOUT_SECONDS
 
 
-def _chat_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None) -> dict[str, Any]:
+def _chat_payload(
+    decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None
+) -> dict[str, Any]:
     payload = dict(body)
     identity = _pop_upstream_identity(payload)
     if decision.model_id:
@@ -466,7 +509,9 @@ def _base_v1_url(url: str) -> str:
     return url
 
 
-def _resolve_endpoint(cfg: dict[str, Any], *, exact_field: str, suffix: str, what: str) -> str:
+def _resolve_endpoint(
+    cfg: dict[str, Any], *, exact_field: str, suffix: str, what: str
+) -> str:
     """Resolve a concrete upstream endpoint URL, fail-closed.
 
     Precedence (preserves the historical ``base_url > <specific> > url`` order):
@@ -487,21 +532,29 @@ def _resolve_endpoint(cfg: dict[str, Any], *, exact_field: str, suffix: str, wha
     url = _valid_endpoint(cfg.get("url"))
     if url:
         return _base_v1_url(url) + suffix
-    raise PantheonGatewayError(503, f"provider has no {what} endpoint configured", config_error=True)
+    raise PantheonGatewayError(
+        503, f"provider has no {what} endpoint configured", config_error=True
+    )
 
 
 def _chat_url(cfg: dict[str, Any], decision: RouteDecision) -> str:
     if model_uses_responses_api(decision.model_id):
         return _responses_url(cfg)
-    return _resolve_endpoint(cfg, exact_field="chat_url", suffix="/chat/completions", what="chat")
+    return _resolve_endpoint(
+        cfg, exact_field="chat_url", suffix="/chat/completions", what="chat"
+    )
 
 
 def _responses_url(cfg: dict[str, Any]) -> str:
-    return _resolve_endpoint(cfg, exact_field="responses_url", suffix="/responses", what="responses")
+    return _resolve_endpoint(
+        cfg, exact_field="responses_url", suffix="/responses", what="responses"
+    )
 
 
 def _embeddings_url(cfg: dict[str, Any]) -> str:
-    return _resolve_endpoint(cfg, exact_field="embeddings_url", suffix="/embeddings", what="embeddings")
+    return _resolve_endpoint(
+        cfg, exact_field="embeddings_url", suffix="/embeddings", what="embeddings"
+    )
 
 
 def _reasoning_budget() -> int:
@@ -594,7 +647,9 @@ def _apply_reasoning_budget(
     return payload
 
 
-def _responses_input_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _responses_input_from_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for message in messages:
         item = dict(message)
@@ -605,7 +660,9 @@ def _responses_input_from_messages(messages: list[dict[str, Any]]) -> list[dict[
                 {
                     "type": "function_call_output",
                     "call_id": item.get("tool_call_id") or item.get("call_id") or "",
-                    "output": item.get("content") if item.get("content") is not None else "",
+                    "output": item.get("content")
+                    if item.get("content") is not None
+                    else "",
                 }
             )
         else:
@@ -623,7 +680,9 @@ def _responses_input_from_messages(messages: list[dict[str, Any]]) -> list[dict[
                     elif converted_part.get("type") == "image_url":
                         converted_part["type"] = "input_image"
                         image_url = converted_part.get("image_url")
-                        if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                        if isinstance(image_url, dict) and isinstance(
+                            image_url.get("url"), str
+                        ):
                             converted_part["image_url"] = image_url["url"]
                     converted_content.append(converted_part)
                 item["content"] = converted_content
@@ -645,7 +704,9 @@ def _responses_input_from_messages(messages: list[dict[str, Any]]) -> list[dict[
     return out
 
 
-def _responses_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None) -> dict[str, Any]:
+def _responses_payload(
+    decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None
+) -> dict[str, Any]:
     payload = _chat_payload(decision, body, stream=None)
     messages = payload.pop("messages", [])
     if isinstance(messages, list):
@@ -660,16 +721,26 @@ def _responses_payload(decision: RouteDecision, body: dict[str, Any], *, stream:
         payload["max_output_tokens"] = payload.pop("max_tokens")
     elif "max_completion_tokens" in payload:
         payload["max_output_tokens"] = payload.pop("max_completion_tokens")
-    return _apply_reasoning_budget(payload, decision.model_id, budget_field="max_output_tokens")
+    return _apply_reasoning_budget(
+        payload, decision.model_id, budget_field="max_output_tokens"
+    )
 
 
-def _provider_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None) -> dict[str, Any]:
+def _provider_payload(
+    decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None
+) -> dict[str, Any]:
+    body = dict(body)
+    body.pop("_pantheon_stream_state", None)
+    if "messages" in body and _effective_max_tokens(body, decision.model_id) <= 0:
+        body["max_tokens"] = 4096
     if model_uses_responses_api(decision.model_id):
         return _responses_payload(decision, body, stream=stream)
     payload = _chat_payload(decision, body, stream=stream)
     if stream is True:
         stream_options = payload.get("stream_options")
-        stream_options = dict(stream_options) if isinstance(stream_options, dict) else {}
+        stream_options = (
+            dict(stream_options) if isinstance(stream_options, dict) else {}
+        )
         stream_options["include_usage"] = True
         payload["stream_options"] = stream_options
     return _apply_reasoning_budget(payload, decision.model_id)
@@ -690,29 +761,46 @@ def _message_from_responses_output(data: dict[str, Any]) -> dict[str, Any]:
                 if text is not None:
                     content_parts.append(str(text))
         elif item_type in {"function_call", "tool_call"}:
-            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            function = (
+                item.get("function") if isinstance(item.get("function"), dict) else {}
+            )
             name = item.get("name") or function.get("name")
-            arguments = item.get("arguments") if "arguments" in item else function.get("arguments")
+            arguments = (
+                item.get("arguments")
+                if "arguments" in item
+                else function.get("arguments")
+            )
             if isinstance(arguments, (dict, list)):
                 arguments = json.dumps(arguments, separators=(",", ":"))
             tool_calls.append(
                 {
-                    "id": item.get("call_id") or item.get("id") or f"call_{len(tool_calls)}",
+                    "id": item.get("call_id")
+                    or item.get("id")
+                    or f"call_{len(tool_calls)}",
                     "type": "function",
                     "function": {"name": name or "", "arguments": arguments or ""},
                 }
             )
-    message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts) or None}
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(content_parts) or None,
+    }
     if tool_calls:
         message["tool_calls"] = tool_calls
     return message
 
 
-def _responses_to_chat_completion(data: dict[str, Any], decision: RouteDecision) -> dict[str, Any]:
+def _responses_to_chat_completion(
+    data: dict[str, Any], decision: RouteDecision
+) -> dict[str, Any]:
     created = int(data.get("created_at") or time.time())
     message = _message_from_responses_output(data)
     finish_reason = "tool_calls" if message.get("tool_calls") else "stop"
-    usage = _responses_chat_usage(data.get("usage")) or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    usage = _responses_chat_usage(data.get("usage")) or {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
     return {
         "id": data.get("id") or f"chatcmpl-pantheon-{created}",
         "object": "chat.completion",
@@ -739,7 +827,9 @@ def _first_chat_message_content(response: dict[str, Any]) -> str:
     return str(content) if content is not None else ""
 
 
-def resolved_wire_model(response: dict[str, Any] | None, decision: RouteDecision) -> str:
+def resolved_wire_model(
+    response: dict[str, Any] | None, decision: RouteDecision
+) -> str:
     if isinstance(response, dict) and response.get("model"):
         return str(response["model"])
     return str(decision.model_id or decision.alias)
@@ -762,16 +852,23 @@ def _make_cooldown_store() -> InMemoryCooldownStore:
 
         return NatsJetStreamCooldownStore()  # type: ignore[return-value]
     except Exception as exc:
-        from mnemos.domain.pantheon.shared_state import SharedStateUnavailable, unavailable_message
+        from mnemos.domain.pantheon.shared_state import (
+            SharedStateUnavailable,
+            unavailable_message,
+        )
 
-        raise SharedStateUnavailable(unavailable_message("cooldown initialization")) from exc
+        raise SharedStateUnavailable(
+            unavailable_message("cooldown initialization")
+        ) from exc
 
 
 def get_runtime() -> RouterRuntime:
     """Process-local RouterRuntime singleton (cooldown breaker + retry/fall-over)."""
     global _RUNTIME
     if _RUNTIME is None:
-        _RUNTIME = RouterRuntime(CooldownManager(_make_cooldown_store()), clock=time.time)
+        _RUNTIME = RouterRuntime(
+            CooldownManager(_make_cooldown_store()), clock=time.time
+        )
     return _RUNTIME
 
 
@@ -816,12 +913,19 @@ def _is_openai_api(decision: RouteDecision) -> bool:
         return False
 
 
-async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+@accounted()
+async def _forward_chat_once(
+    decision: RouteDecision, body: dict[str, Any]
+) -> dict[str, Any]:
     """One provider attempt: POST to the resolved provider, raise on >= 400."""
     cfg = _provider_config(decision)
     client = get_http_client()
     payload = _provider_payload(decision, body, stream=False)
-    url = _responses_url(cfg) if model_uses_responses_api(decision.model_id) else _chat_url(cfg, decision)
+    url = (
+        _responses_url(cfg)
+        if model_uses_responses_api(decision.model_id)
+        else _chat_url(cfg, decision)
+    )
     response = await client.post(
         url,
         json=payload,
@@ -829,7 +933,9 @@ async def _forward_chat_once(decision: RouteDecision, body: dict[str, Any]) -> d
         timeout=_upstream_timeout(cfg),
     )
     if response.status_code >= 400:
-        raise PantheonGatewayError(response.status_code, response.text[:500], retry_after_seconds(response))
+        raise PantheonGatewayError(
+            response.status_code, response.text[:500], retry_after_seconds(response)
+        )
     data = response.json()
     if model_uses_responses_api(decision.model_id):
         data = _responses_to_chat_completion(data, decision)
@@ -842,17 +948,24 @@ class _OpenChatStream:
     decision: RouteDecision
     manager: Any
     response: httpx.Response
-    actual_decision: RouteDecision | None = None  # set by stream_chat_completion to the deployment that actually opened the stream
+    actual_decision: RouteDecision | None = None
+    accounting: Any = None
 
     async def aclose(self) -> None:
         await self.manager.__aexit__(None, None, None)
 
 
-async def _open_chat_stream_once(decision: RouteDecision, body: dict[str, Any]) -> _OpenChatStream:
+async def _open_chat_stream_once(
+    decision: RouteDecision, body: dict[str, Any]
+) -> _OpenChatStream:
     cfg = _provider_config(decision)
     client = get_http_client()
     payload = _provider_payload(decision, body, stream=True)
-    url = _responses_url(cfg) if model_uses_responses_api(decision.model_id) else _chat_url(cfg, decision)
+    url = (
+        _responses_url(cfg)
+        if model_uses_responses_api(decision.model_id)
+        else _chat_url(cfg, decision)
+    )
     manager = client.stream(
         "POST",
         url,
@@ -860,16 +973,28 @@ async def _open_chat_stream_once(decision: RouteDecision, body: dict[str, Any]) 
         headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
         timeout=httpx.Timeout(_upstream_timeout(cfg)),
     )
-    response = await manager.__aenter__()
+    attempt = await begin_attempt(decision, body)
+    try:
+        response = await manager.__aenter__()
+    except BaseException:
+        await attempt.finish("err")
+        raise
     if response.status_code >= 400:
-        body_bytes = await response.aread()
-        await manager.__aexit__(None, None, None)
+        try:
+            body_bytes = await response.aread()
+        finally:
+            try:
+                await manager.__aexit__(None, None, None)
+            finally:
+                await attempt.finish("err")
         raise PantheonGatewayError(
             response.status_code,
             body_bytes[:500].decode("utf-8", "replace"),
             retry_after_seconds(response),
         )
-    return _OpenChatStream(decision=decision, manager=manager, response=response)
+    return _OpenChatStream(
+        decision=decision, manager=manager, response=response, accounting=attempt
+    )
 
 
 def _decision_cooldown_key(decision: RouteDecision) -> str:
@@ -897,12 +1022,18 @@ def _approx_prompt_tokens(body: dict[str, Any]) -> int:
             str(part)
             for message in body["messages"]
             if isinstance(message, dict)
-            for part in (message.get("content") if isinstance(message.get("content"), list) else [message.get("content")])
+            for part in (
+                message.get("content")
+                if isinstance(message.get("content"), list)
+                else [message.get("content")]
+            )
             if part is not None
         )
         return max(0, int((len(text) + 3) / 4))
     if "input" in body:
-        text = " ".join(str(part) for part in (body.get("input") or []) if part is not None)
+        text = " ".join(
+            str(part) for part in (body.get("input") or []) if part is not None
+        )
         return max(0, int((len(text) + 3) / 4))
     return 0
 
@@ -939,8 +1070,12 @@ def _decision_cost_estimate(
     model = decision.model or {}
     if not isinstance(model, dict):
         return 0.0
-    in_cost = _first_pricing_float(model, "input_cost_per_mtok", "price_in", "cost_per_mtok")
-    out_cost = _first_pricing_float(model, "output_cost_per_mtok", "price_out", "cost_per_mtok")
+    in_cost = _first_pricing_float(
+        model, "input_cost_per_mtok", "price_in", "cost_per_mtok"
+    )
+    out_cost = _first_pricing_float(
+        model, "output_cost_per_mtok", "price_out", "cost_per_mtok"
+    )
     if in_cost <= 0.0 and out_cost <= 0.0:
         return 0.0
     if prompt_tokens is None:
@@ -948,9 +1083,13 @@ def _decision_cost_estimate(
     effective_max = _effective_max_tokens(body, decision.model_id)
     if effective_max <= 0:
         try:
-            default_tokens = int(get_settings().pantheon.passthrough_default_estimated_output_tokens)
+            default_tokens = int(
+                get_settings().pantheon.passthrough_default_estimated_output_tokens
+            )
         except Exception:
-            default_tokens = 4096 if getattr(decision, "route_type", None) == "passthrough" else 1024
+            default_tokens = (
+                4096 if getattr(decision, "route_type", None) == "passthrough" else 1024
+            )
         effective_max = max(1, default_tokens)
     n = n_multiplier if n_multiplier is not None else _candidate_multiplicity(body)
     if n < 1:
@@ -959,7 +1098,9 @@ def _decision_cost_estimate(
     return ((in_tokens * in_cost) + (effective_max * out_cost * n)) / 1_000_000.0
 
 
-def _chain_cost_estimate(body: dict[str, Any], chain: list[RouteDecision]) -> tuple[float, str | None]:
+def _chain_cost_estimate(
+    body: dict[str, Any], chain: list[RouteDecision]
+) -> tuple[float, str | None]:
     """Return (worst_case_cost_usd, canonical_provider_of_worst_case_deployment).
 
     The estimate is the MAX across the deployments in the fallback chain — this
@@ -986,7 +1127,11 @@ async def _runtime_chain(decision: RouteDecision) -> list[RouteDecision]:
     if getattr(settings, "cross_provider_fallback", False):
         from mnemos.domain.pantheon import catalog, router
 
-        models = list(decision.catalog_models) if decision.catalog_models is not None else await catalog.catalog_snapshot()
+        models = (
+            list(decision.catalog_models)
+            if decision.catalog_models is not None
+            else await catalog.catalog_snapshot()
+        )
         built = router.build_fallback_chain(decision, models)
         # only providers served by this openai-compatible path can run in the
         # chain; drop graeae-only providers (anthropic/gemini) — keep primary.
@@ -1001,8 +1146,13 @@ def _raise_route_failure(exc: AllDeploymentsFailed) -> None:
     raise PantheonGatewayError(503, str(last) if last else str(exc)) from exc
 
 
-def _codex_oauth_fallback_trigger(decision: RouteDecision, exc: BaseException | None) -> bool:
-    if str(decision.provider or "").strip().lower() not in _CODEX_OAUTH_FALLBACK_PROVIDERS:
+def _codex_oauth_fallback_trigger(
+    decision: RouteDecision, exc: BaseException | None
+) -> bool:
+    if (
+        str(decision.provider or "").strip().lower()
+        not in _CODEX_OAUTH_FALLBACK_PROVIDERS
+    ):
         return False
     if exc is None:
         return False
@@ -1027,7 +1177,9 @@ def _codex_oauth_normalized_failure_trigger(err: Any) -> bool:
     return str(class_value).strip().lower() in {"api_connection", "timeout"}
 
 
-def _codex_oauth_route_failure_trigger(primary: RouteDecision, failure: AllDeploymentsFailed) -> bool:
+def _codex_oauth_route_failure_trigger(
+    primary: RouteDecision, failure: AllDeploymentsFailed
+) -> bool:
     # Fail closed first: a local config fault ANYWHERE in the attempt trail (or the
     # last exception) makes the whole route ineligible for fallback, regardless of
     # target-provider filtering. Without this, a genuine eih/ngc/nvidia 503 paired
@@ -1035,15 +1187,21 @@ def _codex_oauth_route_failure_trigger(primary: RouteDecision, failure: AllDeplo
     # `all(...)` and launder a misconfiguration into fallback traffic.
     if getattr(failure.last_exception, "config_error", False):
         return False
-    if any(getattr(attempt.error, "config_error", False) for attempt in failure.attempts):
+    if any(
+        getattr(attempt.error, "config_error", False) for attempt in failure.attempts
+    ):
         return False
     target_attempts = [
         attempt
         for attempt in failure.attempts
-        if str(getattr(attempt.deployment, "provider", "") or "").strip().lower() in _CODEX_OAUTH_FALLBACK_PROVIDERS
+        if str(getattr(attempt.deployment, "provider", "") or "").strip().lower()
+        in _CODEX_OAUTH_FALLBACK_PROVIDERS
     ]
     if target_attempts:
-        return all(_codex_oauth_normalized_failure_trigger(attempt.error) for attempt in target_attempts)
+        return all(
+            _codex_oauth_normalized_failure_trigger(attempt.error)
+            for attempt in target_attempts
+        )
     return _codex_oauth_fallback_trigger(primary, failure.last_exception)
 
 
@@ -1103,11 +1261,15 @@ async def forward_chat_completion(
         if fallback is not None:
             return ChatCompletionResult(
                 response=fallback,
-                provider=str(decision.provider or ""),
-                model_id=decision.model_id,
+                provider="codex-oauth",
+                model_id=fallback.get("model") or decision.model_id,
             )
         _raise_route_failure(exc)
-    actual = result.deployment if getattr(result, "deployment", None) is not None else decision
+    actual = (
+        result.deployment
+        if getattr(result, "deployment", None) is not None
+        else decision
+    )
     return ChatCompletionResult(
         response=result.result,
         provider=str(actual.provider or decision.provider or ""),
@@ -1116,6 +1278,8 @@ async def forward_chat_completion(
 
 
 async def _yield_openai_chat_stream(opened: _OpenChatStream) -> AsyncIterator[bytes]:
+    attempt = getattr(opened, "accounting", None)
+    outcome = "err"
     try:
         decision = opened.decision
         response = opened.response
@@ -1137,10 +1301,18 @@ async def _yield_openai_chat_stream(opened: _OpenChatStream) -> AsyncIterator[by
                 except json.JSONDecodeError:
                     yield (line + "\n\n").encode("utf-8")
                     continue
-                response_obj = data.get("response") if isinstance(data.get("response"), dict) else None
+                if attempt is not None:
+                    attempt.observe(data)
+                response_obj = (
+                    data.get("response")
+                    if isinstance(data.get("response"), dict)
+                    else None
+                )
                 if response_obj and response_obj.get("model"):
                     model = str(response_obj["model"])
-                for event in _responses_stream_events(data, stream_id=stream_id, created=created, model=model, state=state):
+                for event in _responses_stream_events(
+                    data, stream_id=stream_id, created=created, model=model, state=state
+                ):
                     yield event
             if not state.get("finished"):
                 yield _stream_event(
@@ -1152,12 +1324,20 @@ async def _yield_openai_chat_stream(opened: _OpenChatStream) -> AsyncIterator[by
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
                 )
+            outcome = "ok"
             yield b"data: [DONE]\n\n"
             return
         async for chunk in response.aiter_bytes():
+            if attempt is not None:
+                attempt.feed(chunk)
             yield chunk
+        outcome = "ok"
     finally:
-        await opened.aclose()
+        try:
+            await opened.aclose()
+        finally:
+            if attempt is not None:
+                await attempt.finish(outcome)
 
 
 async def preflight_chat_endpoint(decision: RouteDecision) -> None:
@@ -1210,7 +1390,9 @@ async def preflight_chat_endpoint(decision: RouteDecision) -> None:
         _auth_headers(dep_cfg)
 
 
-async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
+async def stream_chat_completion(
+    decision: RouteDecision, body: dict[str, Any]
+) -> AsyncIterator[bytes]:
     if decision.route_type == "consensus":
         async for event in consensus_chat_completion_stream(decision, body):
             yield event
@@ -1218,6 +1400,7 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
 
     cfg = _provider_config(decision)
     if cfg.get("api", "openai") != "openai":
+        body.get("_pantheon_stream_state", {})["actual"] = decision
         async for event in _graeae_chat_completion_stream(decision, body):
             yield event
         return
@@ -1242,17 +1425,28 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
                 try:
                     from mnemos.domain.pantheon import codex_oauth
 
-                    async for chunk in codex_oauth.stream_chat_completion(decision, body):
+                    async for chunk in codex_oauth.stream_chat_completion(
+                        decision, body
+                    ):
                         yield chunk
                     return
                 except Exception as fallback_exc:  # noqa: BLE001
-                    logger.debug("[PANTHEON] Codex OAuth streaming fallback skipped/failed: %s", fallback_exc)
+                    logger.debug(
+                        "[PANTHEON] Codex OAuth streaming fallback skipped/failed: %s",
+                        fallback_exc,
+                    )
             _raise_route_failure(exc)
-        actual = result.deployment if getattr(result, "deployment", None) is not None else decision
+        actual = (
+            result.deployment
+            if getattr(result, "deployment", None) is not None
+            else decision
+        )
         _ACTIVE_STREAM_ACTUAL.set(actual)
+        body.get("_pantheon_stream_state", {})["actual"] = actual
         try:
-            async for chunk in _yield_openai_chat_stream(result.result):
-                yield chunk
+            async with aclosing(_yield_openai_chat_stream(result.result)) as upstream:
+                async for chunk in upstream:
+                    yield chunk
         finally:
             _ACTIVE_STREAM_ACTUAL.reset(token)
     finally:
@@ -1263,7 +1457,10 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
             pass
 
 
-async def _forward_embeddings_once(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+@accounted(embeddings=True)
+async def _forward_embeddings_once(
+    decision: RouteDecision, body: dict[str, Any]
+) -> dict[str, Any]:
     cfg = _provider_config(decision)
     client = get_http_client()
     payload = _provider_payload(decision, body, stream=None)
@@ -1280,9 +1477,13 @@ async def _forward_embeddings_once(decision: RouteDecision, body: dict[str, Any]
     return data
 
 
-async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+async def forward_embeddings(
+    decision: RouteDecision, body: dict[str, Any]
+) -> dict[str, Any]:
     if decision.route_type == "consensus":
-        raise PantheonGatewayError(400, "consensus aliases are not valid for embeddings")
+        raise PantheonGatewayError(
+            400, "consensus aliases are not valid for embeddings"
+        )
     runtime = get_runtime()
     try:
         result = await runtime.route(
@@ -1297,7 +1498,9 @@ async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> d
     return result.result
 
 
-async def _graeae_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+async def _graeae_chat_completion(
+    decision: RouteDecision, body: dict[str, Any]
+) -> dict[str, Any]:
     payload = _provider_payload(decision, body, stream=None)
     messages = payload.get("messages") or body.get("messages") or []
     prompt = _flatten_messages_for_prompt(messages)
@@ -1315,11 +1518,16 @@ async def _graeae_chat_completion(decision: RouteDecision, body: dict[str, Any])
     if result.get("status") != "success":
         raise PantheonGatewayError(503, result.get("error") or "provider unavailable")
     return _openai_chat_response(
-        decision.model_id or decision.alias, result.get("choices"), result.get("response_text", ""), messages
+        decision.model_id or decision.alias,
+        result.get("choices"),
+        result.get("response_text", ""),
+        messages,
     )
 
 
-async def _graeae_chat_completion_stream(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
+async def _graeae_chat_completion_stream(
+    decision: RouteDecision, body: dict[str, Any]
+) -> AsyncIterator[bytes]:
     response = await _graeae_chat_completion(decision, body)
     yield _stream_event(
         {
@@ -1353,7 +1561,9 @@ async def _graeae_chat_completion_stream(decision: RouteDecision, body: dict[str
     yield b"data: [DONE]\n\n"
 
 
-async def consensus_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
+async def consensus_chat_completion(
+    decision: RouteDecision, body: dict[str, Any]
+) -> dict[str, Any]:
     messages = body.get("messages") or []
     prompt = _flatten_messages_for_prompt(messages)
     engine = get_graeae_engine()
@@ -1391,11 +1601,15 @@ def _responses_chat_usage(usage: Any) -> dict[str, int] | None:
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "total_tokens": total_tokens if total_tokens is not None else prompt + completion,
+        "total_tokens": total_tokens
+        if total_tokens is not None
+        else prompt + completion,
     }
 
 
-async def consensus_chat_completion_stream(decision: RouteDecision, body: dict[str, Any]) -> AsyncIterator[bytes]:
+async def consensus_chat_completion_stream(
+    decision: RouteDecision, body: dict[str, Any]
+) -> AsyncIterator[bytes]:
     response = await consensus_chat_completion(decision, body)
     yield _stream_event(
         {
@@ -1430,7 +1644,11 @@ async def consensus_chat_completion_stream(decision: RouteDecision, body: dict[s
 
 
 def _generation_params(body: dict[str, Any]) -> dict[str, Any]:
-    return {key: body[key] for key in ("temperature", "max_tokens", "top_p") if body.get(key) is not None}
+    return {
+        key: body[key]
+        for key in ("temperature", "max_tokens", "top_p")
+        if body.get(key) is not None
+    }
 
 
 def _request_params(body: dict[str, Any]) -> dict[str, Any]:
@@ -1456,14 +1674,20 @@ def _openai_chat_response(
 ) -> dict[str, Any]:
     created = int(time.time())
     content_text = str(content) if content is not None else ""
-    normalized_choices = choices if isinstance(choices, list) else [
-        {
-            "index": 0,
-            "message": {"role": "assistant", "content": content_text},
-            "finish_reason": "stop",
-        }
-    ]
-    prompt_tokens = sum(len(_content_text(message.get("content")).split()) for message in messages)
+    normalized_choices = (
+        choices
+        if isinstance(choices, list)
+        else [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content_text},
+                "finish_reason": "stop",
+            }
+        ]
+    )
+    prompt_tokens = sum(
+        len(_content_text(message.get("content")).split()) for message in messages
+    )
     completion_tokens = len(content_text.split())
     return {
         "id": f"chatcmpl-pantheon-{created}",
@@ -1479,7 +1703,14 @@ def _openai_chat_response(
     }
 
 
-def _responses_stream_events(data: dict[str, Any], *, stream_id: str, created: int, model: str, state: dict[str, Any]) -> list[bytes]:
+def _responses_stream_events(
+    data: dict[str, Any],
+    *,
+    stream_id: str,
+    created: int,
+    model: str,
+    state: dict[str, Any],
+) -> list[bytes]:
     """Translate Responses API SSE objects into chat.completion.chunk frames."""
     events: list[bytes] = []
     if not state.get("started"):
@@ -1528,7 +1759,9 @@ def _responses_stream_events(data: dict[str, Any], *, stream_id: str, created: i
                                         "index": int(data.get("output_index") or 0),
                                         "id": call_id,
                                         "type": "function",
-                                        "function": {"arguments": data.get("delta") or ""},
+                                        "function": {
+                                            "arguments": data.get("delta") or ""
+                                        },
                                     }
                                 ]
                             },
@@ -1557,9 +1790,14 @@ def _responses_stream_events(data: dict[str, Any], *, stream_id: str, created: i
                                     "tool_calls": [
                                         {
                                             "index": int(data.get("output_index") or 0),
-                                            "id": item.get("call_id") or item.get("id") or "call_0",
+                                            "id": item.get("call_id")
+                                            or item.get("id")
+                                            or "call_0",
                                             "type": "function",
-                                            "function": {"name": item.get("name") or "", "arguments": arguments},
+                                            "function": {
+                                                "name": item.get("name") or "",
+                                                "arguments": arguments,
+                                            },
                                         }
                                     ]
                                 },
@@ -1572,7 +1810,9 @@ def _responses_stream_events(data: dict[str, Any], *, stream_id: str, created: i
         if not state.get("finished"):
             state["finished"] = True
             reason = "stop" if event_type == "response.completed" else "length"
-            response_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
+            response_obj = (
+                data.get("response") if isinstance(data.get("response"), dict) else {}
+            )
             events.append(
                 _stream_event(
                     {
@@ -1584,7 +1824,9 @@ def _responses_stream_events(data: dict[str, Any], *, stream_id: str, created: i
                     }
                 )
             )
-            usage = _responses_chat_usage(response_obj.get("usage") if isinstance(response_obj, dict) else None)
+            usage = _responses_chat_usage(
+                response_obj.get("usage") if isinstance(response_obj, dict) else None
+            )
             if usage is not None:
                 events.append(
                     _stream_event(

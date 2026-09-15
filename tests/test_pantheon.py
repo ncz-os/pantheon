@@ -4,7 +4,6 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-
 from mnemos.api.dependencies import UserContext, get_current_user
 
 
@@ -71,12 +70,13 @@ class _FakeEngine:
 
 @pytest.fixture
 def pantheon_client(monkeypatch, tmp_path):
-    from mnemos.api.main import app
-    from mnemos.core.config import _reset_settings_for_tests
     import mnemos.core.lifecycle as lc
     import mnemos.domain.pantheon.catalog as pantheon_catalog
     import mnemos.domain.pantheon.gateway as pantheon_gateway
+    from mnemos.api.main import app
+    from mnemos.core.config import _reset_settings_for_tests
 
+    monkeypatch.setenv("MNEMOS_AUTH_ENABLED", "true")
     monkeypatch.setenv("MNEMOS_PANTHEON_ENABLED", "true")
     monkeypatch.setenv("MNEMOS_PANTHEON_DEFAULT_QUALITY_FLOOR", "0.90")
     monkeypatch.setenv("MNEMOS_PANTHEON_DEFAULT_MAX_COST", "10.0")
@@ -109,6 +109,7 @@ def test_models_disabled_returns_503(monkeypatch, tmp_path):
     from mnemos.api.main import app
     from mnemos.core.config import _reset_settings_for_tests
 
+    monkeypatch.setenv("MNEMOS_AUTH_ENABLED", "true")
     monkeypatch.setenv("MNEMOS_PANTHEON_ENABLED", "false")
     monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "pantheon-disabled.sqlite"))
     _reset_settings_for_tests()
@@ -131,13 +132,19 @@ def test_models_enabled_lists_mocked_graeae_registry(pantheon_client):
     assert response.status_code == 200
     data = response.json()
     assert data["object"] == "list"
-    assert {model["id"] for model in data["data"]} == {"cheap-chat", "reason-pro", "code-pro"}
+    assert {model["id"] for model in data["data"]} == {
+        "cheap-chat",
+        "reason-pro",
+        "code-pro",
+    }
     assert data["data"][0]["capabilities"]
     assert data["data"][0]["usage_tier"]
     assert "health" in data["data"][0]
 
 
-def test_chat_auto_cheap_resolves_to_cheapest_and_calls_provider(monkeypatch, pantheon_client):
+def test_chat_auto_cheap_resolves_to_cheapest_and_calls_provider(
+    monkeypatch, pantheon_client
+):
     import mnemos.domain.pantheon.gateway as pantheon_gateway
 
     calls = []
@@ -194,7 +201,10 @@ def test_chat_auto_reasoning_respects_quality_floor(monkeypatch, pantheon_client
 
     response = pantheon_client.post(
         "/pantheon/v1/chat/completions",
-        json={"model": "auto:reasoning", "messages": [{"role": "user", "content": "think"}]},
+        json={
+            "model": "auto:reasoning",
+            "messages": [{"role": "user", "content": "think"}],
+        },
     )
 
     assert response.status_code == 200
@@ -227,7 +237,9 @@ async def test_tool_pantheon_list_models_filters_code(monkeypatch, pantheon_clie
 
 
 @pytest.mark.asyncio
-async def test_tool_pantheon_route_explain_matches_http_shape(monkeypatch, pantheon_client):
+async def test_tool_pantheon_route_explain_matches_http_shape(
+    monkeypatch, pantheon_client
+):
     del monkeypatch
     from mnemos.mcp.tools.models import tool_pantheon_route_explain
 

@@ -23,7 +23,6 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-
 from mnemos.domain.pantheon import catalog, gateway
 from mnemos.domain.pantheon.budget import evaluate_budget
 from mnemos.domain.pantheon.gateway import (
@@ -31,10 +30,8 @@ from mnemos.domain.pantheon.gateway import (
     _chain_cost_estimate,
     _decision_cost_estimate,
     _effective_max_tokens,
-    _runtime_chain,
 )
 from mnemos.domain.pantheon.router import RouteDecision
-
 
 # ── 1. Alias canonicalization (claude ↔ anthropic) ────────────────────────
 
@@ -119,20 +116,17 @@ async def test_alias_bypass_denies_against_canonical_cap(monkeypatch):
     # request is routed under the GRAEAE alias ``claude``; admission must deny.
     monkeypatch.setenv("MNEMOS_KNEMON_PROVIDER_BUDGET_CAPS_USD", "anthropic=1.0")
     from mnemos.core.config import _reset_settings_for_tests
+
     _reset_settings_for_tests()
 
     backend = _ProviderBudgetBackend(per_provider_spent={"anthropic": 1.0})
 
     # Patch the spend query to return canonical-keyed spend regardless of which
     # spelling the caller asked for.
-    async def fake_rows(_backend, sql, params=None):
-        params = params or {}
-        if "FROM usage_ledger" in " ".join(sql.split()) and "SUM(est_cost_usd)" in " ".join(sql.split()):
-            provider_key = params.get("provider")
-            return [{"spent_usd": backend.per_provider_spent.get(provider_key, 0.0)}]
-        return []
+    async def fake_spend(_backend, *, provider=None, **kwargs):
+        return backend.per_provider_spent.get(provider, 0.0)
 
-    monkeypatch.setattr("mnemos.domain.knemon.budget._rows", fake_rows)
+    monkeypatch.setattr("mnemos.domain.knemon.budget.effective_spend_usd", fake_spend)
 
     # Same call shape the route layer uses: decision.provider == "claude" (alias).
     decision = SimpleNamespace(provider="claude", model_id="claude-opus-4")
@@ -233,8 +227,6 @@ def test_forward_chat_completion_records_actual_deployment():
         # First call fails on the primary, second succeeds on the fallback.
         attempts = 0
         last_exc: Exception | None = None
-        from mnemos.domain.pantheon.fallback import AttemptRecord
-        from mnemos.domain.pantheon.errors import RetryAction, NormalizedError
         for deployment in chain:
             attempts += 1
             try:
@@ -287,8 +279,18 @@ def test_forward_chat_completion_records_actual_deployment():
                 "object": "chat.completion",
                 "created": 1,
                 "model": "claude-opus-4-fb",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             },
             deployment=fallback,
             attempts=tuple(),
@@ -317,7 +319,11 @@ def test_forward_chat_completion_records_actual_deployment():
     # Dict-compat shim keeps legacy callers working: the embedded response
     # (which contains ``model`` plus usage / choices) is dict-equal.
     assert result["model"] == "claude-opus-4-fb"
-    assert result["usage"] == {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    assert result["usage"] == {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
 
 
 def test_chat_completion_result_dict_equality_and_dict_ops():
@@ -391,7 +397,10 @@ def test_effective_max_tokens_zero_when_not_reasoning():
     )
     assert _effective_max_tokens({"messages": []}, decision.model_id) == 0
     # When the caller sets a value it must NOT be rewritten.
-    assert _effective_max_tokens({"max_tokens": 50, "messages": []}, decision.model_id) == 50
+    assert (
+        _effective_max_tokens({"max_tokens": 50, "messages": []}, decision.model_id)
+        == 50
+    )
 
 
 def test_decision_cost_estimate_uses_post_rewrite_allowance():
@@ -485,6 +494,7 @@ def test_route_layer_records_canonical_provider_under_alias(monkeypatch):
     """
     from mnemos.api.routes import pantheon as pantheon_routes
     from mnemos.domain.pantheon import catalog, gateway, router
+
     from tests.conftest import FakePool, FakePoolBackedBackend
 
     pool = FakePool()
@@ -527,7 +537,7 @@ def test_route_layer_records_canonical_provider_under_alias(monkeypatch):
 
     # Decision: alias ``claude``, registry key ``anthropic``. The passthrough
     # model carries realistic pricing so the estimate is non-zero.
-    passthrough_decision = router._passthrough_decision(
+    router._passthrough_decision(
         "passthrough-model",
         _passthrough_router_settings().pantheon,
         [],
@@ -568,14 +578,20 @@ def test_route_layer_records_canonical_provider_under_alias(monkeypatch):
                 "created": 1,
                 "model": "passthrough-model",
                 "choices": [],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             },
             provider="claude",  # alias
             model_id="passthrough-model",
         )
 
     monkeypatch.setattr(gateway, "forward_chat_completion", fake_forward)
-    monkeypatch.setattr(gateway, "resolved_wire_model", lambda r, d: "passthrough-model")
+    monkeypatch.setattr(
+        gateway, "resolved_wire_model", lambda r, d: "passthrough-model"
+    )
 
     asyncio.run(
         pantheon_routes._chat_completions_impl(
@@ -585,7 +601,10 @@ def test_route_layer_records_canonical_provider_under_alias(monkeypatch):
                 state=SimpleNamespace(),
                 client=SimpleNamespace(host="test"),
             ),
-            {"model": "passthrough-model", "messages": [{"role": "user", "content": "hi"}]},
+            {
+                "model": "passthrough-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
             SimpleNamespace(user_id="u1", namespace="ns1"),
         )
     )
@@ -597,13 +616,9 @@ def test_route_layer_records_canonical_provider_under_alias(monkeypatch):
         "the canonical key 'anthropic' must be used so the per-provider cap is "
         "checked against the same identity the ledger records under."
     )
-    # The recorded ledger row also uses the canonical key — same identity
-    # means KNEMON's weekly-spend query can find both writes.
-    assert ledger_calls, "ledger was not recorded"
-    assert ledger_calls[0]["provider"] == "anthropic", (
-        f"F05 alias-bypass: ledger recorded provider={ledger_calls[0]['provider']!r}; "
-        "must be the canonical key, matching the admission query."
-    )
+    # Mocked forwarding does not execute any provider attempt. The route
+    # audit must not append a second (duplicate) provider ledger row.
+    assert ledger_calls == []
     # Audit metadata also surfaces the actually-executed deployment's
     # canonical form for downstream consumers.
     assert scheduled, "audit was not scheduled"
@@ -620,6 +635,7 @@ def test_route_layer_records_post_fallback_provider(monkeypatch):
     """
     from mnemos.api.routes import pantheon as pantheon_routes
     from mnemos.domain.pantheon import catalog, gateway, router
+
     from tests.conftest import FakePool, FakePoolBackedBackend
 
     pool = FakePool()
@@ -660,7 +676,7 @@ def test_route_layer_records_post_fallback_provider(monkeypatch):
     monkeypatch.setattr(router, "get_settings", _passthrough_router_settings)
     monkeypatch.setattr(gateway, "get_settings", _passthrough_router_settings)
 
-    passthrough_decision = router._passthrough_decision(
+    router._passthrough_decision(
         "passthrough-model",
         _passthrough_router_settings().pantheon,
         [],
@@ -700,7 +716,11 @@ def test_route_layer_records_post_fallback_provider(monkeypatch):
                 "created": 1,
                 "model": "claude-fb-model",
                 "choices": [],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             },
             provider="anthropic",  # post-fallback identity
             model_id="claude-fb-model",
@@ -717,21 +737,15 @@ def test_route_layer_records_post_fallback_provider(monkeypatch):
                 state=SimpleNamespace(),
                 client=SimpleNamespace(host="test"),
             ),
-            {"model": "passthrough-model", "messages": [{"role": "user", "content": "hi"}]},
+            {
+                "model": "passthrough-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
             SimpleNamespace(user_id="u1", namespace="ns1"),
         )
     )
 
-    assert ledger_calls, "ledger was not recorded"
-    # The PRIMARY was ``claude``; the result records ``anthropic``. Without
-    # the fix, the ledger row would say ``claude`` and the cap set on the
-    # fallback's provider would silently miss the row.
-    assert ledger_calls[0]["provider"] == "anthropic", (
-        f"F05 fallback-identity loss: ledger recorded provider="
-        f"{ledger_calls[0]['provider']!r}; must be the fallback's 'anthropic' "
-        "— the originally-requested primary was 'claude' but it did not run."
-    )
-    assert ledger_calls[0]["model"] == "claude-fb-model"
+    assert ledger_calls == []  # mocked gateway; no duplicate route ledger
     # Audit metadata surfaces the actually-executed provider for downstream
     # consumers, separately from the originally-requested primary.
     assert scheduled, "audit was not scheduled"
@@ -847,7 +861,9 @@ def test_route_layer_records_post_rewrite_token_allowance(monkeypatch):
 # ── Cross-cutting: runtime chain + alias both collapse correctly ─────────
 
 
-def test_check_budget_canonicalizes_worst_case_provider_in_chain(monkeypatch):
+def test_advisory_budget_checks_primary_before_per_attempt_fallback_reservation(
+    monkeypatch,
+):
     """The budget call uses the canonical key for the WORST chain deployment.
 
     F05's most insidious path: a cheap primary (alias ``claude``) admits cheaply,
@@ -858,7 +874,7 @@ def test_check_budget_canonicalizes_worst_case_provider_in_chain(monkeypatch):
     Reproduces the chain-aware alias bypass the F05 review flagged.
     """
     from mnemos.api.routes import pantheon as pantheon_routes
-    from mnemos.domain.pantheon import catalog, gateway, router
+    from mnemos.domain.pantheon import gateway, router
 
     def _settings():
         return SimpleNamespace(
@@ -917,9 +933,7 @@ def test_check_budget_canonicalizes_worst_case_provider_in_chain(monkeypatch):
     async def _fake_catalog_snapshot(**_kwargs):
         return [fallback_model]
 
-    monkeypatch.setattr(
-        catalog_module, "catalog_snapshot", _fake_catalog_snapshot
-    )
+    monkeypatch.setattr(catalog_module, "catalog_snapshot", _fake_catalog_snapshot)
     # Mark the fallback as openai-API so the chain isn't trimmed by the
     # _is_openai_api guard inside _runtime_chain.
     monkeypatch.setattr(gateway, "_is_openai_api", lambda d: True)
@@ -967,13 +981,10 @@ def test_check_budget_canonicalizes_worst_case_provider_in_chain(monkeypatch):
         "key so the per-provider cap configured under 'anthropic' catches this "
         "request even though the primary was routed under the 'claude' alias."
     )
-    # Sanity: the chain-aware estimate must dominate the primary-only estimate.
-    primary_only_cost = _decision_cost_estimate(
-        {"messages": [{"role": "user", "content": "hi"}]}, primary_decision, prompt_tokens=10
-    )
-    assert estimated_cost > primary_only_cost, (
-        "F05 chain+alias bypass: worst-case chain estimate must dominate the "
-        "primary-only estimate so the cap is enforced against what could actually run."
+    assert estimated_cost == pytest.approx(
+        _decision_cost_estimate(
+            {"messages": [{"role": "user", "content": "hi"}]}, primary_decision
+        )
     )
 
 

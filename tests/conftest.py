@@ -12,27 +12,6 @@ from typing import Any
 import pytest
 
 
-# PANTHEON telemetry-loss-reporting fix: the sibling KNEMON checkout is not
-# present in this multi-repo workspace, so the ``mnemos.domain.knemon.budget``
-# module that ``mnemos.domain.pantheon.budget`` imports at module-load time
-# would fail with ``ModuleNotFoundError``. Install the runtime stub
-# FIRST — before any test module (including this conftest's pytest
-# sessionstart hook) triggers a transitive import. The stub installs
-# an unlimited budget gate by default so non-budget tests don't have to
-# think about it; budget-gating tests monkey-patch
-# ``mnemos.domain.knemon.budget._rows`` to drive specific verdicts.
-_STUB_PATH = Path(__file__).resolve().parent / "_mnemos_knemon_stubs.py"
-import importlib.util as _importlib_util  # noqa: E402
-
-_spec = _importlib_util.spec_from_file_location("_mnemos_knemon_runtime", _STUB_PATH)
-if _spec is None or _spec.loader is None:
-    raise RuntimeError(f"could not load knemon runtime stub from {_STUB_PATH!s}")
-_module = _importlib_util.module_from_spec(_spec)
-sys.modules.setdefault("_mnemos_knemon_runtime", _module)
-_spec.loader.exec_module(_module)
-_module.install()
-
-
 def pytest_sessionstart(session) -> None:
     """Wire optional routers once with PANTHEON enabled before test-local toggles."""
     previous = os.environ.get("MNEMOS_PANTHEON_ENABLED")
@@ -112,8 +91,16 @@ def pytest_sessionstart(session) -> None:
         # ModuleType — we only nudge the existing namespace packages'
         # ``__path__`` lists so subsequent ``__import__`` calls find the
         # sibling roots.
-        for _sub in ("api", "domain", "core", "audit", "cli", "db",
-                     "persistence", "workers"):
+        for _sub in (
+            "api",
+            "domain",
+            "core",
+            "audit",
+            "cli",
+            "db",
+            "persistence",
+            "workers",
+        ):
             modname = f"mnemos.{_sub}"
             try:
                 __import__(modname)
@@ -165,6 +152,7 @@ def pytest_sessionstart(session) -> None:
             os.environ["MNEMOS_PANTHEON_ENABLED"] = previous
         try:
             from mnemos.core.config import _reset_settings_for_tests
+
             _reset_settings_for_tests()
         except Exception as _cfg_exc:  # noqa: BLE001
             import warnings as _warnings  # noqa: E402
@@ -184,8 +172,14 @@ class _FakeConnection:
         compact = " ".join(query.split())
         if "FROM usage_ledger" in compact and "SUM(est_cost_usd)" in compact:
             caller = str(args[0]) if args else "pantheon"
-            rows = [row for row in self.state["usage_ledger"] if row.get("caller_subsystem") == caller]
-            return [{"spent_usd": sum(float(row.get("est_cost_usd") or 0) for row in rows)}]
+            rows = [
+                row
+                for row in self.state["usage_ledger"]
+                if row.get("caller_subsystem") == caller
+            ]
+            return [
+                {"spent_usd": sum(float(row.get("est_cost_usd") or 0) for row in rows)}
+            ]
         if "FROM pantheon_routing_audit" in compact:
             return list(self.state["pantheon_routing_audit"])
         if "FROM model_registry" in compact:
@@ -235,7 +229,9 @@ class FakePoolBackedBackend:
         payload = record["payload_json"]
         if isinstance(payload, str):
             payload = json.loads(payload)
-        self._pool.state["pantheon_routing_audit"].append({**record, "payload": payload})
+        self._pool.state["pantheon_routing_audit"].append(
+            {**record, "payload": payload}
+        )
 
     async def record_usage_ledger(self, _tx, record):
         from mnemos.persistence.base import UsageLedgerResult
@@ -249,7 +245,9 @@ class FakePoolBackedBackend:
             "est_cost_usd": cost,
         }
         self._pool.state["usage_ledger"].append(row)
-        return UsageLedgerResult(id=len(self._pool.state["usage_ledger"]), est_cost_usd=cost)
+        return UsageLedgerResult(
+            id=len(self._pool.state["usage_ledger"]), est_cost_usd=cost
+        )
 
 
 @pytest.fixture
@@ -286,3 +284,15 @@ def _editable_worker_namespace():
     worker_path = str(Path(__file__).parents[1] / "mnemos" / "workers")
     if worker_path not in mnemos.workers.__path__:
         mnemos.workers.__path__.append(worker_path)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_budget_defaults(monkeypatch):
+    """Gateway unit tests start uncapped; budget tests set explicit policy."""
+    monkeypatch.setenv("MNEMOS_KNEMON_WEEKLY_BUDGET_CAP_USD", "0")
+    monkeypatch.setenv("MNEMOS_KNEMON_PROVIDER_BUDGET_CAPS_USD", "")
+    from mnemos.core.config import get_settings
+
+    policy = get_settings().knemon
+    monkeypatch.setattr(policy, "weekly_budget_cap_usd", 0.0)
+    monkeypatch.setattr(policy, "provider_budget_caps_usd", "")
