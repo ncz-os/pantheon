@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from mnemos.domain.pantheon.budget import BudgetVerdict, evaluate_budget
 from mnemos.domain.pantheon.keyvault import (
     ChainKeyResolver,
@@ -33,10 +32,10 @@ class _BudgetBackend:
 
 @pytest.fixture
 def budget_rows(monkeypatch):
-    async def fake_rows(backend, sql, params=None):
-        return [{"spent_usd": backend.spent_usd}]
+    async def fake_spend(backend, **kwargs):
+        return backend.spent_usd
 
-    monkeypatch.setattr("mnemos.domain.knemon.budget._rows", fake_rows)
+    monkeypatch.setattr("mnemos.domain.knemon.budget.effective_spend_usd", fake_spend)
 
 
 @pytest.mark.asyncio
@@ -53,13 +52,17 @@ async def test_budget_exhausted(budget_rows):
 
 @pytest.mark.asyncio
 async def test_budget_estimate_would_exceed_denies_precall(budget_rows):
-    d = await evaluate_budget(backend=_BudgetBackend(9.5), limit_usd=10.0, estimated_cost_usd=1.0)
+    d = await evaluate_budget(
+        backend=_BudgetBackend(9.5), limit_usd=10.0, estimated_cost_usd=1.0
+    )
     assert not d.allowed and "exceed" in d.reason
 
 
 @pytest.mark.asyncio
 async def test_budget_estimate_within_allows(budget_rows):
-    d = await evaluate_budget(backend=_BudgetBackend(9.5), limit_usd=10.0, estimated_cost_usd=0.4)
+    d = await evaluate_budget(
+        backend=_BudgetBackend(9.5), limit_usd=10.0, estimated_cost_usd=0.4
+    )
     assert d.allowed
 
 
@@ -85,7 +88,9 @@ async def test_budget_forwards_provider_to_knemon(monkeypatch):
         calls.append((backend, kwargs))
         return object()
 
-    monkeypatch.setattr("mnemos.domain.pantheon.budget.evaluate_usage_budget", fake_evaluate)
+    monkeypatch.setattr(
+        "mnemos.domain.pantheon.budget.evaluate_usage_budget", fake_evaluate
+    )
     backend = object()
 
     result = await evaluate_budget(backend=backend, provider="openai")

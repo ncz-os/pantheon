@@ -11,7 +11,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "MNEMOS Contributors" }]
 maintainers = [{ name = "Jason Perlow", email = "jperlow@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "mnemos-core>=6.2,<7",
     "mnemos-graeae>=0.1.0,<0.2",
@@ -20,16 +20,6 @@ dependencies = [
     "gunicorn",
     "httpx",
     "uvicorn",
-    # PANTHEON telemetry-loss-reporting: the local mnemos-core stub ships no
-    # Python code (the real `mnemos.core` runtime is resolved from the
-    # sibling mnemos-core checkout via the pytest `pythonpath`), so the
-    # transitive runtime deps that the real `mnemos-core` would normally
-    # pull in (pydantic-settings, asyncpg, python-dotenv) need to be
-    # declared here for the `uv run pytest` validator to find them in a
-    # fresh venv. Without these the preflight `from mnemos.api.main import
-    # app` in `tests/conftest.py::pytest_sessionstart` crashes at
-    # collection time with `ModuleNotFoundError: No module named
-    # 'pydantic_settings'` before any test of interest runs.
     "python-dotenv>=1.0.0",
 ]
 
@@ -41,24 +31,10 @@ test = [
 ]
 
 [tool.uv.sources]
-# PANTHEON telemetry-loss-reporting fix: the mnemos-* sibling packages are
-# not published to PyPI as independently installable distributions in this
-# checkout — they ship bundled with mnemos-deploy in production. To keep
-# `uv run pytest` resolvable in this multi-repo workspace we map each
-# sibling to a local stub. All three stubs ship no Python code
-# (`include = []` in each stub's pyproject.toml) so they cannot shadow the
-# PEP 420 namespace contributions that the existing editable installs in
-# this project's `.venv/` already provide for the real `mnemos.core` /
-# `mnemos.domain.graeae` / `mnemos.domain.knemon` packages. The earlier
-# F05 attempt to share mnemos-core with the sibling KNEMON checkout via
-# `../knemon/mnemos-stubs/mnemos_core` broke once that sibling checkout
-# was moved (uv refuses to resolve a single transitive dep to a missing
-# URL). The PANTHEON telemetry-loss-reporting fix bundles the core stub
-# inside this repo so the validator is independent of sibling-checkout
-# layout.
-mnemos-core   = { path = "mnemos-stubs/mnemos_core" }
-mnemos-graeae = { path = "mnemos-stubs/mnemos_graeae" }
-mnemos-knemon = { path = "mnemos-stubs/mnemos_knemon" }
+# Development overlays must resolve actual production code, never placeholder packages.
+mnemos-core = { path = "../mnemos-core", editable = true }
+mnemos-graeae = { path = "../graeae", editable = true }
+mnemos-knemon = { path = "../knemon", editable = true }
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -73,44 +49,11 @@ namespaces = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Version-pin cleanup (2026-09-15): this file previously listed absolute,
-# machine-specific pythonpath entries
-# (`/Users/jasonperlow/mnemos-core-release`,
-# `/Users/jasonperlow/graeae-quota-fix`) pointing at scratch worktrees from
-# a single operator's local session — meaningless on any other machine
-# (CI runners, other operators) and already dead on this one, since those
-# scratch checkouts no longer exist. A third entry in the same list
-# (pointing at a deleted `mnemos-fix-f04f05-budget/knemon` worktree) was
-# already removed for the identical reason during the PANTHEON telemetry-
-# loss-reporting fix; these two were missed at the time. Per that same
-# fix's own reasoning: the venv's editable installs already provide the
-# real `mnemos.core` / `mnemos.domain.graeae` packages, so this pythonpath
-# fallback was never load-bearing for normal test runs — only for a
-# provisioning gap on one machine, using paths specific to that machine.
-# Tests that genuinely need a package this repo doesn't ship a real
-# dependency on should carry their own runtime stub (see
-# `tests/_knemon_stubs.py` for the existing pattern) rather than relying
-# on an operator's local sibling-checkout layout.
 
 [dependency-groups]
 dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
     "aiosqlite>=0.22.1",
-    "asyncpg>=0.31.0",
-    "authlib>=1.8.0",
-    "cryptography>=50.0.1",
-    "itsdangerous>=2.2.0",
-    "limits>=5.8.0",
-    "mcp>=2.2.0",
-    "opentelemetry-api>=1.44.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
-    "opentelemetry-sdk>=1.44.0",
-    "prometheus-client>=0.26.0",
-    "pydantic-settings>=2.15.0",
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "python-multipart>=0.0.32",
-    "slowapi>=0.1.10",
-    "starlette>=1.6.0",
-    "structlog>=26.1.0",
-    "typer>=0.27.2",
+    "mcp>=1,<2",
 ]

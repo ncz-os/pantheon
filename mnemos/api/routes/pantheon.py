@@ -7,19 +7,16 @@ import json
 import logging
 import time
 import uuid
-from decimal import Decimal
+from contextlib import aclosing
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.config import get_settings
-from mnemos.core.services import service_enabled
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
-from mnemos.core.plan_windows import compute_plan_window_id
 from mnemos.core.rate_limit import limiter
-from mnemos.persistence.base import UsageLedgerRecord
+from mnemos.core.services import service_enabled
 from mnemos.domain.pantheon.shared_state import SharedStateUnavailable
 
 router = APIRouter(prefix="/pantheon/v1", tags=["pantheon"])
@@ -67,10 +64,14 @@ def _require_enabled() -> None:
 
 def _pantheon_imports() -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
     _require_enabled()
-    from mnemos.domain.pantheon import budget, catalog, gateway, router as pantheon_router
+    from mnemos.domain.pantheon import budget, catalog, gateway
+    from mnemos.domain.pantheon import router as pantheon_router
     from mnemos.domain.pantheon.aliases import PantheonRoutingError
     from mnemos.domain.pantheon.caps import consultation_cap_bucket
-    from mnemos.domain.pantheon.routing_log import routing_payload, schedule_routing_audit
+    from mnemos.domain.pantheon.routing_log import (
+        routing_payload,
+        schedule_routing_audit,
+    )
 
     return (
         catalog,
@@ -172,21 +173,31 @@ def _responses_content_to_chat(content: Any) -> Any:
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
-        raise _responses_input_error("Responses message content must be a string or array")
+        raise _responses_input_error(
+            "Responses message content must be a string or array"
+        )
     converted: list[dict[str, Any]] = []
     for part in content:
         if not isinstance(part, dict):
-            raise _responses_input_error("Responses message content items must be objects")
+            raise _responses_input_error(
+                "Responses message content items must be objects"
+            )
         item_type = part.get("type")
-        if item_type in {"input_text", "output_text", "text"} and isinstance(part.get("text"), str):
+        if item_type in {"input_text", "output_text", "text"} and isinstance(
+            part.get("text"), str
+        ):
             converted.append({"type": "text", "text": part["text"]})
-        elif item_type in {"input_image", "image_url"} and isinstance(part.get("image_url"), (str, dict)):
+        elif item_type in {"input_image", "image_url"} and isinstance(
+            part.get("image_url"), (str, dict)
+        ):
             image_url = part["image_url"]
             if isinstance(image_url, str):
                 image_url = {"url": image_url}
             converted.append({"type": "image_url", "image_url": image_url})
         else:
-            raise _responses_input_error(f"Unsupported Responses content item type: {item_type!r}")
+            raise _responses_input_error(
+                f"Unsupported Responses content item type: {item_type!r}"
+            )
     return converted
 
 
@@ -194,7 +205,9 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
     if not isinstance(input_value, list) or not input_value:
-        raise _responses_input_error("Responses input must be a non-empty string or array")
+        raise _responses_input_error(
+            "Responses input must be a non-empty string or array"
+        )
     messages: list[dict[str, Any]] = []
     for item in input_value:
         if not isinstance(item, dict):
@@ -203,14 +216,25 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
         if item_type == "message":
             role = item.get("role")
             if role not in {"developer", "system", "user", "assistant"}:
-                raise _responses_input_error(f"Unsupported Responses message role: {role!r}")
-            messages.append({"role": role, "content": _responses_content_to_chat(item.get("content"))})
+                raise _responses_input_error(
+                    f"Unsupported Responses message role: {role!r}"
+                )
+            messages.append(
+                {
+                    "role": role,
+                    "content": _responses_content_to_chat(item.get("content")),
+                }
+            )
         elif item_type == "function_call":
             call_id = item.get("call_id") or item.get("id")
             name = item.get("name")
             arguments = item.get("arguments")
-            if not all(isinstance(value, str) and value for value in (call_id, name, arguments)):
-                raise _responses_input_error("Responses function_call requires call_id, name, and arguments")
+            if not all(
+                isinstance(value, str) and value for value in (call_id, name, arguments)
+            ):
+                raise _responses_input_error(
+                    "Responses function_call requires call_id, name, and arguments"
+                )
             messages.append(
                 {
                     "role": "assistant",
@@ -227,11 +251,21 @@ def _responses_input_to_messages(input_value: Any) -> list[dict[str, Any]]:
         elif item_type == "function_call_output":
             call_id = item.get("call_id")
             output = item.get("output")
-            if not isinstance(call_id, str) or not call_id or not isinstance(output, str):
-                raise _responses_input_error("Responses function_call_output requires call_id and string output")
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": output})
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or not isinstance(output, str)
+            ):
+                raise _responses_input_error(
+                    "Responses function_call_output requires call_id and string output"
+                )
+            messages.append(
+                {"role": "tool", "tool_call_id": call_id, "content": output}
+            )
         else:
-            raise _responses_input_error(f"Unsupported Responses input item type: {item_type!r}")
+            raise _responses_input_error(
+                f"Unsupported Responses input item type: {item_type!r}"
+            )
     return messages
 
 
@@ -305,7 +339,9 @@ async def _check_consultation_cap(
     async_check = getattr(consultation_cap_bucket, "acheck_and_increment", None)
     if async_check is not None:
         return await async_check(user_id=user_id, session_id=session_id, cap=cap)
-    return consultation_cap_bucket.check_and_increment(user_id=user_id, session_id=session_id, cap=cap)
+    return consultation_cap_bucket.check_and_increment(
+        user_id=user_id, session_id=session_id, cap=cap
+    )
 
 
 def _audit_payload_for_response(
@@ -442,82 +478,22 @@ async def _check_budget_or_deny(
     import mnemos.core.lifecycle as lc
     import mnemos.domain.pantheon.gateway as gateway_module
 
-    # Estimate the cost against the FINAL wire shape for every deployment in
-    # the runtime chain. We can't know which one will execute at admission
-    # time, so we reserve headroom for the worst-case (most expensive)
-    # deployment — the cap is then enforced against a cost that will NOT be
-    # exceeded by any actual execution. This closes F05's token-rewrite and
-    # fallback-identity leaks: the estimate is computed against the post-
-    # rewrite token allowance and folds in any cross-provider candidate that
-    # may run if the primary fails.
-    chain = await gateway_module._runtime_chain(decision)
-    chain_cost, worst_provider = gateway_module._chain_cost_estimate(body, chain)
-    estimated_cost_usd = chain_cost if chain_cost > 0 else _estimate_cost_usd(decision, body)
+    # Advisory fast rejection for the primary. Each actual retry/fallback
+    # reserves its own deployment's cost before upstream I/O.
+    estimated_cost_usd = gateway_module._decision_cost_estimate(body, decision)
     client_hint_usd = _client_estimated_cost_hint_usd(body)
-    provider_for_budget = _canonical_provider_for(
-        decision if (worst_provider is None or not worst_provider) else worst_provider
-    )
+    provider_for_budget = _canonical_provider_for(decision)
     budget_decision = await budget_module.evaluate_budget(
         backend=lc._persistence_backend,
         estimated_cost_usd=estimated_cost_usd,
         caller_subsystem="pantheon",
         provider=provider_for_budget or None,
     )
-    return (None if budget_decision.allowed else _budget_denied_response(budget_decision), estimated_cost_usd, client_hint_usd)
-
-
-async def _record_pantheon_ledger(
-    payload: dict[str, Any],
-    metadata: dict[str, Any],
-    decision: Any,
-    *,
-    actual_decision: Any | None = None,
-) -> None:
-    """Record the PANTHEON leg of the usage ledger.
-
-    ``actual_decision`` overrides ``decision`` for the ``provider``/``model``
-    fields when supplied — this is the actually-executed deployment (e.g. the
-    fallback target after a cross-provider fallover). Both the admission call
-    and this record go through ``canonical_*`` so a single physical provider
-    cannot evade its cap under either alias spelling.
-    """
-    import mnemos.core.lifecycle as lc
-
-    backend = lc._persistence_backend
-    recorder = getattr(backend, "record_usage_ledger", None) if backend is not None else None
-    if recorder is None:
-        return
-    cost_override = None
-    effective_decision = actual_decision if actual_decision is not None else decision
-    if getattr(effective_decision, "route_type", None) == "passthrough" and payload.get("cost_usd") is not None:
-        cost_override = Decimal(str(payload["cost_usd"]))
-    canonical_provider = _canonical_provider_for(effective_decision) or "pantheon"
-    canonical_model = _canonical_model_for(effective_decision) or "pantheon"
-    record = UsageLedgerRecord(
-        provider=canonical_provider,
-        model=canonical_model,
-        task_kind=str(getattr(effective_decision, "task_type", None) or payload.get("alias_or_model") or "pantheon"),
-        tokens_in=int(payload.get("tokens_in") or 0),
-        tokens_out=int(payload.get("tokens_out") or 0),
-        tokens_reasoning=0,
-        latency_ms=int(round(float(payload.get("latency_ms") or 0))),
-        outcome="ok" if payload.get("outcome") == "success" else "err",
-        caller_subsystem="pantheon",
-        tier="api",
-        session_id=str(metadata.get("session_id") or "") or None,
-        request_count=1,
-        plan_window_id=compute_plan_window_id(canonical_provider, "api"),
-        path_kind="api",
-        est_cost_usd=cost_override,
+    return (
+        None if budget_decision.allowed else _budget_denied_response(budget_decision),
+        estimated_cost_usd,
+        client_hint_usd,
     )
-    try:
-        async with backend.transactional() as tx:
-            result = await recorder(tx, record)
-        if payload.get("cost_usd") is None:
-            payload["cost_usd"] = float(result.est_cost_usd)
-            metadata["cost_usd"] = payload["cost_usd"]
-    except Exception as exc:
-        logger.debug("[PANTHEON] usage_ledger record failed: %s", exc)
 
 
 async def _log_route_outcome(
@@ -559,8 +535,7 @@ async def _log_route_outcome(
         actual_provider=actual_provider,
         actual_model_id=actual_model_id,
     )
-    if outcome != "budget_denied":
-        await _record_pantheon_ledger(payload, metadata, decision, actual_decision=actual_decision)
+    # Provider attempts own the usage ledger; this layer owns route audit only.
     schedule_routing_audit(payload, metadata)
 
 
@@ -631,7 +606,9 @@ def _normalize_usage(usage: Any) -> dict[str, int] | None:
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
-        "total_tokens": total_tokens if total_tokens is not None else prompt + completion,
+        "total_tokens": total_tokens
+        if total_tokens is not None
+        else prompt + completion,
     }
 
 
@@ -675,7 +652,10 @@ def _stream_usage_response(
         "prompt_tokens": fallback_prompt_tokens,
         "completion_tokens": max(0, int((completion_chars + 3) / 4)),
     }
-    response_usage.setdefault("total_tokens", response_usage["prompt_tokens"] + response_usage["completion_tokens"])
+    response_usage.setdefault(
+        "total_tokens",
+        response_usage["prompt_tokens"] + response_usage["completion_tokens"],
+    )
     return {"model": model, "usage": response_usage}
 
 
@@ -728,7 +708,9 @@ async def _chat_completions_impl(
     decision: Any | None = None
     session_id = _pantheon_session_id(request, user)
     request_id = _request_id(request)
-    identity = _upstream_identity(gateway, request, user, session_id=session_id, request_id=request_id)
+    identity = _upstream_identity(
+        gateway, request, user, session_id=session_id, request_id=request_id
+    )
     try:
         require_shared_state = getattr(gateway, "require_shared_state", None)
         if require_shared_state is not None:
@@ -747,7 +729,11 @@ async def _chat_completions_impl(
             return _consultation_cap_exceeded(cap_result)
         if budget is not None:
             budget_started_at = time.perf_counter()
-            budget_response, estimated_cost_usd, client_estimated_cost_usd = await _check_budget_or_deny(
+            (
+                budget_response,
+                estimated_cost_usd,
+                client_estimated_cost_usd,
+            ) = await _check_budget_or_deny(
                 budget,
                 decision,
                 body,
@@ -779,6 +765,9 @@ async def _chat_completions_impl(
             # here to become a clean 503 (not a 200 that aborts mid-stream).
             await gateway.preflight_chat_endpoint(decision)
 
+            stream_state: dict[str, Any] = {}
+            forward_body["_pantheon_stream_state"] = stream_state
+
             async def audited_stream():
                 stream_buffer = ""
                 wire_model: str | None = None
@@ -799,16 +788,19 @@ async def _chat_completions_impl(
                     completion_chars += len(_stream_event_completion_text(event))
 
                 try:
-                    async for chunk in gateway.stream_chat_completion(decision, forward_body):
-                        try:
-                            stream_buffer += chunk.decode("utf-8", "ignore")
-                        except AttributeError:
-                            stream_buffer += str(chunk)
-                        events = stream_buffer.split("\n\n")
-                        stream_buffer = events.pop()
-                        for event in events:
-                            ingest_event(event)
-                        yield chunk
+                    async with aclosing(
+                        gateway.stream_chat_completion(decision, forward_body)
+                    ) as upstream:
+                        async for chunk in upstream:
+                            try:
+                                stream_buffer += chunk.decode("utf-8", "ignore")
+                            except AttributeError:
+                                stream_buffer += str(chunk)
+                            events = stream_buffer.split("\n\n")
+                            stream_buffer = events.pop()
+                            for event in events:
+                                ingest_event(event)
+                            yield chunk
                 except asyncio.CancelledError as exc:
                     outcome = "cancelled"
                     error_class = exc.__class__.__name__
@@ -834,9 +826,13 @@ async def _chat_completions_impl(
                     # stashes it in a contextvar (set BEFORE iterating this generator
                     # body) so the route handler can audit/record against the post-
                     # fallback identity instead of the originally requested one.
-                    actual = gateway.active_stream_actual_decision() or decision
-                    actual_provider = getattr(actual, "provider", None) or decision.provider
-                    actual_model_id = getattr(actual, "model_id", None) or decision.model_id
+                    actual = stream_state.get("actual") or decision
+                    actual_provider = (
+                        getattr(actual, "provider", None) or decision.provider
+                    )
+                    actual_model_id = (
+                        getattr(actual, "model_id", None) or decision.model_id
+                    )
                     try:
                         await _log_route_outcome(
                             routing_payload=routing_payload,
@@ -851,7 +847,10 @@ async def _chat_completions_impl(
                             error_class=error_class,
                             namespace=user.namespace,
                             forwarded_user=identity.opaque_user,
-                            resolved_wire_model=wire_model or actual_model_id or decision.model_id or decision.alias,
+                            resolved_wire_model=wire_model
+                            or actual_model_id
+                            or decision.model_id
+                            or decision.alias,
                             actual_decision=actual,
                             actual_provider=actual_provider,
                             actual_model_id=actual_model_id,
@@ -871,9 +870,7 @@ async def _chat_completions_impl(
         # providers writes the ledger row under the original primary's identity
         # and silently bypasses that provider's per-provider cap.
         actual_provider = getattr(response_data, "provider", None) or decision.provider
-        actual_model_id = (
-            getattr(response_data, "model_id", None) or decision.model_id
-        )
+        actual_model_id = getattr(response_data, "model_id", None) or decision.model_id
         await _log_route_outcome_best_effort(
             routing_payload=routing_payload,
             schedule_routing_audit=schedule_routing_audit,
@@ -886,12 +883,17 @@ async def _chat_completions_impl(
             response=response_data,
             namespace=user.namespace,
             forwarded_user=identity.opaque_user,
-            resolved_wire_model=actual_model_id or gateway.resolved_wire_model(response_data, decision),
+            resolved_wire_model=actual_model_id
+            or gateway.resolved_wire_model(response_data, decision),
             actual_decision=response_data,
             actual_provider=actual_provider,
             actual_model_id=actual_model_id,
         )
-        return JSONResponse(response_data.response if hasattr(response_data, "response") else response_data)
+        return JSONResponse(
+            response_data.response
+            if hasattr(response_data, "response")
+            else response_data
+        )
     except PantheonRoutingError as exc:
         raise _to_http_exception(exc) from exc
     except SharedStateUnavailable as exc:
@@ -963,7 +965,9 @@ async def _responses_impl(
             {
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": message.get("content") or ""}],
+                "content": [
+                    {"type": "output_text", "text": message.get("content") or ""}
+                ],
             }
         )
     for call in message.get("tool_calls") or []:
@@ -1018,11 +1022,17 @@ async def embeddings(
     decision: Any | None = None
     session_id = _pantheon_session_id(request, user)
     request_id = _request_id(request)
-    identity = _upstream_identity(gateway, request, user, session_id=session_id, request_id=request_id)
+    identity = _upstream_identity(
+        gateway, request, user, session_id=session_id, request_id=request_id
+    )
     try:
         decision = await pantheon_router.route_model(model, body)
         budget_started_at = time.perf_counter()
-        budget_response, estimated_cost_usd, client_estimated_cost_usd = await _check_budget_or_deny(
+        (
+            budget_response,
+            estimated_cost_usd,
+            client_estimated_cost_usd,
+        ) = await _check_budget_or_deny(
             budget,
             decision,
             body,
