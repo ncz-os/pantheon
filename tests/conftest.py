@@ -57,9 +57,35 @@ def pytest_sessionstart(session) -> None:
         # ``mnemos.audit.submodule`` import resolves through both PEP 420
         # namespace discovery AND the regular package importer.
         _LOCAL_MNEMOS = os.path.join(os.getcwd(), "mnemos")
-        _SIBLING_ROOTS = (
-            "/Users/jasonperlow/mnemos-core-release",
-            "/Users/jasonperlow/graeae-quota-fix",
+        # Version-pin cleanup (2026-09-15): this used to hardcode two
+        # absolute, machine-specific paths
+        # (/Users/jasonperlow/mnemos-core-release,
+        # /Users/jasonperlow/graeae-quota-fix) — scratch checkouts from one
+        # operator's local session, meaningless on any other machine.
+        #
+        # This repo's own README documents no CI job actually runs this
+        # test suite (.gitlab-ci.yml only runs ruff) — `uv run pytest` here
+        # is exclusively a LOCAL/dev-loop tool, and this sys.path surgery
+        # is the only thing that makes it resolve `mnemos.core` /
+        # `mnemos.api` at all (confirmed: removing sibling roots entirely
+        # breaks collection in 31 test files, not just a handful). So the
+        # right fix is not "remove it" but "point it at the convention
+        # this repo family actually documents" — graeae/README.md's own
+        # setup instructions clone the real mnemos-core repo as `../mnemos-
+        # core` next to each split-package checkout:
+        #   git clone https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
+        #   git clone https://gitlab.com/ncz-os/graeae.git ../graeae
+        # Default to that relative, documented layout (works for any
+        # operator who set their workspace up as instructed, portable
+        # across machines since it's relative to this repo, not absolute);
+        # override via MNEMOS_SIBLING_ROOTS (a `:`-separated path list) if
+        # your layout differs.
+        _SIBLING_ROOTS = tuple(
+            p
+            for p in os.environ.get(
+                "MNEMOS_SIBLING_ROOTS", "../mnemos-core:../graeae"
+            ).split(":")
+            if p
         )
         _mnemos_dirs: list[str] = []
         for _r in _SIBLING_ROOTS:
@@ -103,8 +129,7 @@ def pytest_sessionstart(session) -> None:
             # For each known sibling root, add the matching subdir if it
             # exists. This is the only place we mutate ``__path__`` for
             # child namespaces — and only by extending, never by replacing.
-            for _root in ("/Users/jasonperlow/mnemos-core-release",
-                          "/Users/jasonperlow/graeae-quota-fix"):
+            for _root in _SIBLING_ROOTS:
                 candidate = os.path.join(_root, "mnemos", _sub)
                 if os.path.isdir(candidate) and candidate not in existing:
                     existing.append(candidate)

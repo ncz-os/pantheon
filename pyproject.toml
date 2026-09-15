@@ -73,23 +73,24 @@ namespaces = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Sibling-repo source roots so the PEP 420 `mnemos` namespace resolves to
-# the real `mnemos.core` / `mnemos.domain.graeae` packages at test time.
-# The venv's editable installs already provide these; the pythonpath
-# entries here act as a fallback in environments where the venv was
-# provisioned without them. The earlier F05 fix also pointed at
-# `/Users/jasonperlow/Projects/mnemos-fix-f04f05-budget/knemon` for the
-# `mnemos.domain.knemon` package, but that sibling checkout has since
-# been removed from the workspace — referencing it here made the
-# validator crash at startup with "No such file or directory" instead
-# of pytest failing on the test of interest. The PANTHEON
-# telemetry-loss-reporting fix removes the dead knemon entry; tests
-# that genuinely need `mnemos.domain.knemon` ship their own runtime
-# stub via `tests/_knemon_stubs.py` (see `conftest.py`).
-pythonpath = [
-    "/Users/jasonperlow/mnemos-core-release",
-    "/Users/jasonperlow/graeae-quota-fix",
-]
+# Version-pin cleanup (2026-09-15): this file previously listed absolute,
+# machine-specific pythonpath entries
+# (`/Users/jasonperlow/mnemos-core-release`,
+# `/Users/jasonperlow/graeae-quota-fix`) pointing at scratch worktrees from
+# a single operator's local session — meaningless on any other machine
+# (CI runners, other operators) and already dead on this one, since those
+# scratch checkouts no longer exist. A third entry in the same list
+# (pointing at a deleted `mnemos-fix-f04f05-budget/knemon` worktree) was
+# already removed for the identical reason during the PANTHEON telemetry-
+# loss-reporting fix; these two were missed at the time. Per that same
+# fix's own reasoning: the venv's editable installs already provide the
+# real `mnemos.core` / `mnemos.domain.graeae` packages, so this pythonpath
+# fallback was never load-bearing for normal test runs — only for a
+# provisioning gap on one machine, using paths specific to that machine.
+# Tests that genuinely need a package this repo doesn't ship a real
+# dependency on should carry their own runtime stub (see
+# `tests/_knemon_stubs.py` for the existing pattern) rather than relying
+# on an operator's local sibling-checkout layout.
 
 [dependency-groups]
 dev = [
