@@ -17,6 +17,10 @@ from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.domain.graeae.engine import get_graeae_engine
 
 logger = logging.getLogger(__name__)
+
+# Set once by _warn_registry_overlay_unavailable() so the missing overlay is
+# reported a single time per process rather than on every catalog read.
+_registry_overlay_warned = False
 CATALOG_CACHE_SCHEMA = "mnemos.pantheon.catalog.v1"
 
 
@@ -475,9 +479,38 @@ def _fill_missing_model_defaults(base: dict[str, Any], defaults: dict[str, Any])
     return out
 
 
+def _warn_registry_overlay_unavailable() -> None:
+    """Log once when the model_registry overlay cannot be reached.
+
+    ``mnemos.core.lifecycle._pool`` is populated only for the Postgres
+    profile; every other backend sets it to ``None``. The overlay supplying
+    pricing, capabilities, context windows and arena rank therefore vanishes
+    from ``list_models()`` on Oracle, SQLite, MySQL, MariaDB and Db2.
+
+    That failure was previously silent -- ``_registry_rows()`` returned an
+    empty list before reaching any logging, so ``/v1/models`` still answered
+    with a catalog, just one missing every registry-sourced field. Emitted
+    once per process so the degradation is diagnosable without logging on
+    every catalog read.
+    """
+    global _registry_overlay_warned
+    if _registry_overlay_warned:
+        return
+    _registry_overlay_warned = True
+
+    backend = getattr(_lc, "_persistence_backend", None)
+    logger.warning(
+        "[PANTHEON] model_registry overlay unavailable on %s: catalog is "
+        "served without registry pricing, capabilities, context windows or "
+        "arena rank. The overlay currently requires the Postgres backend.",
+        type(backend).__name__ if backend is not None else "no configured backend",
+    )
+
+
 async def _registry_rows() -> list[Any]:
     pool = _lc._pool
     if pool is None:
+        _warn_registry_overlay_unavailable()
         return []
     queries = [
         """
