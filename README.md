@@ -9,7 +9,7 @@ subpackage.
 pip install mnemos-core mnemos-pantheon
 ```
 
-PANTHEON is bundled in the Mnemos umbrella image (`ghcr.io/ncz-os/mnemos`); when
+PANTHEON is bundled in the Mnemos umbrella image (`ghcr.io/ncz-os/mnemos-enterprise`); when
 the distribution is present, `mnemos-core` mounts its routes automatically.
 
 The distribution keeps the original import paths through PEP 420 namespace
@@ -70,6 +70,32 @@ different installed distribution that turns `mnemos` into a regular package can
 hide namespace portions from sibling distributions unless it explicitly extends
 the package path.
 
+
+## Backend coverage
+
+**The `model_registry` overlay behind `GET /pantheon/v1/models` is
+PostgreSQL-only.** `_registry_rows()` reads `mnemos.core.lifecycle._pool`, which
+core populates only for the PostgreSQL profile and sets to `None` everywhere
+else, so on SQLite, MySQL, MariaDB, Oracle and Db2 it returns an empty list. The
+registry-sourced fields — pricing, capabilities, context window, max output
+tokens and arena rank — are then simply absent from `list_models()`.
+
+The failure is quiet rather than loud: `/v1/models` still answers with a
+catalog, because the GRAEAE engine and the JSON/SQLite cache paths survive. Two
+things are lost. Models that also come from another source keep their entry but
+lose every registry-sourced field, since the registry loop is what supplies
+them. Models that exist **only** in `model_registry` are absent from the catalog
+altogether — that loop is the only thing that would have added them. That
+matters in practice, because the shipped
+`deploy/docker-compose.mnemos-api.yml` runs the Oracle image, so this has been
+the live configuration.
+
+This is **not fixed**, and is not presented as fixed. It is now diagnosable: one
+warning per process naming the active backend. Closing it properly means either
+widening core's neutral `ConsultationAuditRepository.fetch_available_models`
+(which returns three columns where this call site consumes seventeen, and which
+risks regressing core's own `openai_compat` consumer) or adding a new ABC method
+in core plus six backend implementations. Either is a core-owner decision.
 
 ## Build infrastructure & partners
 
