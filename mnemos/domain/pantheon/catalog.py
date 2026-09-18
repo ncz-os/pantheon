@@ -60,7 +60,7 @@ def canonical_provider(provider: str | None) -> str:
         return "openai"
     try:
         configured = str(get_settings().pantheon.passthrough_provider or "").strip().lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         configured = ""
     if configured and lower == configured:
         return configured
@@ -209,7 +209,7 @@ def _fleet_model(model_id: Any) -> dict[str, Any] | None:
 def _fleet_provider(fleet: dict[str, Any]) -> str:
     try:
         configured = get_settings().pantheon.passthrough_provider
-    except Exception:
+    except Exception:  # noqa: BLE001
         configured = None
     provider = str(configured or fleet.get("provider") or "").strip()
     return provider or "nvidia"
@@ -482,16 +482,24 @@ def _fill_missing_model_defaults(base: dict[str, Any], defaults: dict[str, Any])
 def _warn_registry_overlay_unavailable() -> None:
     """Log once when the model_registry overlay cannot be reached.
 
-    ``mnemos.core.lifecycle._pool`` is populated only for the Postgres
-    profile; every other backend sets it to ``None``. The overlay supplying
-    pricing, capabilities, context windows and arena rank therefore vanishes
-    from ``list_models()`` on Oracle, SQLite, MySQL, MariaDB and Db2.
+    Every shipped persistence backend -- Postgres, SQLite, MySQL, MariaDB,
+    Oracle and Db2 -- implements ``ConsultationAuditRepository`` and
+    guarantees ``provider``/``model_id``/``display_name`` from
+    ``fetch_available_models()``; Oracle's implementation currently returns
+    richer fields on top of that (family, pricing, capabilities, arena
+    rank/score, context window). Whatever the active backend doesn't supply
+    directly (pricing, capabilities, context window, arena rank on the other
+    five) can still be filled in by the synced pricing cache
+    (``mnemos.domain.pantheon.pricing``) when it has run.
 
-    That failure was previously silent -- ``_registry_rows()`` returned an
-    empty list before reaching any logging, so ``/v1/models`` still answered
-    with a catalog, just one missing every registry-sourced field. Emitted
-    once per process so the degradation is diagnosable without logging on
-    every catalog read.
+    This warning fires only when even that guaranteed baseline could not be
+    read -- no persistence backend AND no legacy pool configured, or the
+    configured backend's ``consultations_audit`` call itself failed/is
+    missing. ``_registry_rows()`` still returns an empty list in that case
+    (never raises), so ``/v1/models`` keeps answering from the GRAEAE engine
+    and JSON/synced-cache paths; models that exist *only* in
+    ``model_registry`` are what's actually lost. Emitted once per process so
+    the degradation is diagnosable without logging on every catalog read.
     """
     global _registry_overlay_warned
     if _registry_overlay_warned:
@@ -501,17 +509,48 @@ def _warn_registry_overlay_unavailable() -> None:
     backend = getattr(_lc, "_persistence_backend", None)
     logger.warning(
         "[PANTHEON] model_registry overlay unavailable on %s: catalog is "
-        "served without registry pricing, capabilities, context windows or "
-        "arena rank. The overlay currently requires the Postgres backend.",
+        "served without model_registry-sourced data for this read. Every "
+        "persistence backend guarantees provider/model_id/display_name via "
+        "ConsultationAuditRepository.fetch_available_models(); Oracle "
+        "currently returns richer fields (pricing, capabilities, arena "
+        "rank/score, context window). Missing fields on other backends may "
+        "still be backfilled by the synced pricing cache.",
         type(backend).__name__ if backend is not None else "no configured backend",
     )
 
 
-async def _registry_rows() -> list[Any]:
-    pool = _lc._pool
-    if pool is None:
-        _warn_registry_overlay_unavailable()
-        return []
+async def _registry_rows_via_backend(backend: Any) -> list[Any] | None:
+    """Fetch model_registry rows through the backend-neutral audit repository.
+
+    Returns ``None`` -- not ``[]`` -- when the backend cannot serve the
+    overlay at all (no ``consultations_audit`` repository, no
+    ``transactional()``, or the call raised), so the caller can distinguish
+    "backend incapable / failing" from "backend queried successfully and the
+    registry is genuinely empty".
+    """
+    consultations_audit = getattr(backend, "consultations_audit", None)
+    transactional = getattr(backend, "transactional", None)
+    if consultations_audit is None or not callable(transactional):
+        logger.debug(
+            "[PANTHEON] persistence backend %s exposes no consultations_audit capability",
+            type(backend).__name__,
+        )
+        return None
+    try:
+        async with transactional() as tx:
+            rows = await consultations_audit.fetch_available_models(tx)
+        return list(rows) if rows is not None else []
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[PANTHEON] model_registry overlay unavailable via %s.consultations_audit: %s",
+            type(backend).__name__,
+            exc,
+        )
+        return None
+
+
+async def _registry_rows_via_pool(pool: Any) -> list[Any] | None:
+    """Fetch the richer legacy projection from an asyncpg-compatible pool."""
     queries = [
         """
         SELECT provider, model_id, display_name, capabilities,
@@ -539,12 +578,50 @@ async def _registry_rows() -> list[Any]:
             for query in queries:
                 try:
                     return list(await conn.fetch(query))
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     logger.debug("[PANTHEON] model_registry catalog overlay unavailable: %s", exc)
-            return []
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[PANTHEON] model_registry catalog overlay unavailable: %s", exc)
+    return None
+
+
+async def _registry_rows() -> list[Any]:
+    """Return model_registry rows for the catalog overlay.
+
+    Backend-neutral path first: every backend (Postgres, SQLite, MySQL,
+    MariaDB, Oracle, Db2) implements
+    ``ConsultationAuditRepository.fetch_available_models`` inside a
+    ``backend.transactional()`` scope, so this no longer depends on
+    ``mnemos.core.lifecycle._pool`` (Postgres-only) to see registry data.
+
+    When the configured backend also exposes ``_lc._pool`` (the Postgres
+    profile), the legacy query enriches the neutral three-column result so
+    existing Postgres metadata is preserved. A pool failure falls back to the
+    neutral rows. Non-Postgres profiles set ``_lc._pool`` to ``None``, so they
+    never execute Postgres SQL. The legacy queries also remain compatible with
+    callers that set a pool directly without configuring a backend.
+    """
+    backend = getattr(_lc, "_persistence_backend", None)
+    if backend is not None:
+        rows = await _registry_rows_via_backend(backend)
+        if rows is None:
+            _warn_registry_overlay_unavailable()
+            return []
+        pool = _lc._pool
+        if pool is None:
+            return rows
+        rich_rows = await _registry_rows_via_pool(pool)
+        return rich_rows or rows
+
+    pool = _lc._pool
+    if pool is None:
+        _warn_registry_overlay_unavailable()
         return []
+    rows = await _registry_rows_via_pool(pool)
+    if rows is None:
+        _warn_registry_overlay_unavailable()
+        return []
+    return rows
 
 
 def _sort_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -593,8 +670,8 @@ def _catalog_cache_paths() -> list[Path]:
         configured = get_settings().pantheon.catalog_cache_path
         if configured:
             paths.append(str(configured))
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[PANTHEON] configured catalog cache path unavailable: %s", exc)
     env_path = os.environ.get("MNEMOS_PANTHEON_CATALOG_CACHE_PATH")
     if env_path:
         paths.append(env_path)
@@ -637,7 +714,7 @@ def _cached_catalog_models() -> list[dict[str, Any]]:
             if models:
                 logger.info("[PANTHEON] loaded cached phase-A catalog from %s", path)
                 return models
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[PANTHEON] cached catalog %s unavailable: %s", path, exc)
     return []
 
@@ -731,7 +808,7 @@ async def list_models(*, use_synced_cache: bool = True) -> list[dict[str, Any]]:
     engine = get_graeae_engine()
     try:
         provider_status = engine.provider_status()
-    except Exception:
+    except Exception:  # noqa: BLE001
         provider_status = {}
 
     models: dict[tuple[str, str], dict[str, Any]] = {}

@@ -73,29 +73,36 @@ the package path.
 
 ## Backend coverage
 
-**The `model_registry` overlay behind `GET /pantheon/v1/models` is
-PostgreSQL-only.** `_registry_rows()` reads `mnemos.core.lifecycle._pool`, which
-core populates only for the PostgreSQL profile and sets to `None` everywhere
-else, so on SQLite, MySQL, MariaDB, Oracle and Db2 it returns an empty list. The
-registry-sourced fields — pricing, capabilities, context window, max output
-tokens and arena rank — are then simply absent from `list_models()`.
+**The `model_registry` overlay behind `GET /pantheon/v1/models` is backend-neutral.**
+`_registry_rows()` reads through `mnemos.core.lifecycle._persistence_backend`:
+it opens `backend.transactional()` and calls
+`backend.consultations_audit.fetch_available_models(tx)` — the Mnemos core
+`ConsultationAuditRepository` ABC that Postgres, SQLite, MySQL, MariaDB, Oracle
+and Db2 all implement. `provider` / `model_id` / `display_name` are guaranteed
+on every one of those six backends. Oracle's implementation currently returns
+richer fields on top of that baseline (family, pricing, capabilities, arena
+rank/score, context window); the other five return just the guaranteed three.
+Whatever a given backend doesn't supply directly can still be filled in by the
+synced pricing cache (`mnemos.domain.pantheon.pricing`) when it has run, since
+`list_models()` overlays that cache onto every registry row it sees.
 
-The failure is quiet rather than loud: `/v1/models` still answers with a
-catalog, because the GRAEAE engine and the JSON/SQLite cache paths survive. Two
-things are lost. Models that also come from another source keep their entry but
-lose every registry-sourced field, since the registry loop is what supplies
-them. Models that exist **only** in `model_registry` are absent from the catalog
-altogether — that loop is the only thing that would have added them. That
-matters in practice, because the shipped
-`deploy/docker-compose.mnemos-api.yml` runs the Oracle image, so this has been
-the live configuration.
+If no persistence backend is configured at all (`_lc._persistence_backend is
+None`), `_registry_rows()` falls back to the legacy asyncpg queries against
+`mnemos.core.lifecycle._pool` for compatibility with callers that set the pool
+directly. A configured PostgreSQL backend also uses that pool to enrich the
+ABC's guaranteed three fields with the pre-existing rich projection; if the
+enrichment query fails, the neutral rows remain available. Non-Postgres
+profiles set `_lc._pool` to `None` and never execute that PostgreSQL SQL. A
+configured backend whose `consultations_audit` call is missing or fails is
+logged at debug level, produces one process-wide warning naming the backend,
+and yields an empty registry overlay for that read.
 
-This is **not fixed**, and is not presented as fixed. It is now diagnosable: one
-warning per process naming the active backend. Closing it properly means either
-widening core's neutral `ConsultationAuditRepository.fetch_available_models`
-(which returns three columns where this call site consumes seventeen, and which
-risks regressing core's own `openai_compat` consumer) or adding a new ABC method
-in core plus six backend implementations. Either is a core-owner decision.
+Net effect: `/v1/models` no longer silently loses every registry-sourced field
+on Oracle, SQLite, MySQL, MariaDB or Db2. Models that exist **only** in
+`model_registry` now surface via the guaranteed `provider`/`model_id`/
+`display_name` triple on all six backends, with Oracle additionally carrying
+richer metadata straight from the registry and the synced pricing cache
+backfilling the rest where available.
 
 ## Build infrastructure & partners
 
