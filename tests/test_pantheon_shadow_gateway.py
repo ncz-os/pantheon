@@ -511,20 +511,20 @@ def test_endpoint_helpers_append_suffix_to_base_urls():
     decision = _decision(model_id="openai/openai/gpt-5.5")
 
     assert (
-        gateway._chat_url({"url": "https://inference-api.nvidia.com/v1"}, decision)
-        == "https://inference-api.nvidia.com/v1/chat/completions"
+        gateway._chat_url({"url": "https://inference.example.com/v1"}, decision)
+        == "https://inference.example.com/v1/chat/completions"
     )
     assert (
-        gateway._chat_url({"url": "https://inference-api.nvidia.com/v1/chat/completions"}, decision)
-        == "https://inference-api.nvidia.com/v1/chat/completions"
+        gateway._chat_url({"url": "https://inference.example.com/v1/chat/completions"}, decision)
+        == "https://inference.example.com/v1/chat/completions"
     )
     assert (
-        gateway._responses_url({"url": "https://inference-api.nvidia.com/v1/chat/completions"})
-        == "https://inference-api.nvidia.com/v1/responses"
+        gateway._responses_url({"url": "https://inference.example.com/v1/chat/completions"})
+        == "https://inference.example.com/v1/responses"
     )
     assert (
-        gateway._embeddings_url({"url": "https://inference-api.nvidia.com/v1"})
-        == "https://inference-api.nvidia.com/v1/embeddings"
+        gateway._embeddings_url({"url": "https://inference.example.com/v1"})
+        == "https://inference.example.com/v1/embeddings"
     )
 
 
@@ -565,7 +565,7 @@ def test_passthrough_provider_prefers_operator_base_url_over_engine_url(monkeypa
     monkeypatch.setattr(
         gateway,
         "get_provider_config",
-        lambda provider: {"base_url": "https://inference-api.nvidia.com/v1"} if provider == "nvidia" else {},
+        lambda provider: {"base_url": "https://inference.example.com/v1"} if provider == "nvidia" else {},
     )
     monkeypatch.setattr(gateway, "get_http_client", lambda: _Client())
     monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
@@ -577,7 +577,7 @@ def test_passthrough_provider_prefers_operator_base_url_over_engine_url(monkeypa
         )
     )
 
-    assert posted[0][0] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted[0][0] == "https://inference.example.com/v1/chat/completions"
     assert "integrate.api.nvidia.com" not in posted[0][0]
     assert posted[0][1]["model"] == "openai/openai/gpt-5.5"
 
@@ -602,7 +602,7 @@ def test_chat_null_content_response_passes_through_with_usage(monkeypatch):
     monkeypatch.setattr(
         gateway,
         "_provider_config",
-        lambda d: {"api": "openai", "url": "https://inference-api.nvidia.com/v1/chat/completions"},
+        lambda d: {"api": "openai", "url": "https://inference.example.com/v1/chat/completions"},
     )
     monkeypatch.setattr(gateway, "_auth_headers", lambda cfg, identity=None: {})
 
@@ -613,7 +613,7 @@ def test_chat_null_content_response_passes_through_with_usage(monkeypatch):
         )
     )
 
-    assert posted["url"] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted["url"] == "https://inference.example.com/v1/chat/completions"
     assert posted["json"]["model"] == "gemini-3.1-pro"
     assert data["choices"][0]["message"]["content"] is None
     assert data["choices"][0]["finish_reason"] == "length"
@@ -2151,7 +2151,7 @@ def test_free_nvidia_passthrough_zero_estimate_is_not_pre_denied(monkeypatch):
     monkeypatch.setattr(
         gateway,
         "get_provider_config",
-        lambda provider: {"base_url": "https://inference-api.nvidia.com/v1", "api": "openai", "key_name": "nvidia"}
+        lambda provider: {"base_url": "https://inference.example.com/v1", "api": "openai", "key_name": "nvidia"}
         if provider == "nvidia"
         else {},
     )
@@ -2186,7 +2186,7 @@ def test_free_nvidia_passthrough_zero_estimate_is_not_pre_denied(monkeypatch):
 
     assert response.status_code == 200
     assert budget_calls[0]["estimated_cost_usd"] == 0.0
-    assert posted[0][0] == "https://inference-api.nvidia.com/v1/chat/completions"
+    assert posted[0][0] == "https://inference.example.com/v1/chat/completions"
     assert posted[0][1]["model"] == explicit_model
 
 
